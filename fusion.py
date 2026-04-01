@@ -90,6 +90,20 @@ def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
         return 0.6
     return 0.0
 
+def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
+    """
+    类别兼容分数：
+    - 1.0：强一致（映射后完全一致）
+    - 0.6：同一大类（如 Pedestrian/Cyclist）
+    - 0.0：不兼容
+    """
+    mapped = YOLO_TO_PVRCNN.get(yolo_label.lower())
+    if mapped == pvrcnn_label:
+        return 1.0
+    if same_category_group(yolo_label, pvrcnn_label):
+        return 0.6
+    return 0.0
+
 # ============================================================
 # PART 3  标定参数解析（读取失败自动降级到 theta 模式）
 # ============================================================
