@@ -35,7 +35,12 @@ def main():
             continue
 
         timestamp = pvrcnn_dets[0].get("timestamp", "")
-        fused = fuse(pvrcnn_dets, yolo_dets, calib)
+        fused = fuse(
+            pvrcnn_dets,
+            yolo_dets,
+            calib,
+            include_unmatched_yolo=False,
+        )
 
         if fused:
             tracked = mot.update(fused, timestamp)
@@ -48,7 +53,7 @@ def main():
     output = {
         "meta": {
             "total_frames": len(all_results),
-            "fusion_mode": "theta (无标定文件)"
+            "fusion_mode": "calib" if calib.use_calib else "theta"
         },
         "frames": all_results
     }

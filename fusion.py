@@ -36,6 +36,10 @@ IOU_THRESH      = 0.1
 W_PVRCNN        = 0.6
 W_YOLO          = 0.4
 FUSED_THRESH    = 0.1
+THETA_MATCH_DEG = 10.0
+THETA_SIGMA_DEG = 6.0
+MIN_THETA_SIM   = 0.35
+UNMATCHED_YOLO_MIN_SCORE = 0.6
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -233,8 +237,15 @@ def lidar_center_to_theta(center: List[float], fov: float = CAMERA_FOV_DEG) -> f
     return float(np.clip(theta_deg, -fov / 2, fov / 2))
 
 
-def theta_to_proj_bbox(det3d: Dict, det2d: Dict, img_width: int = IMAGE_WIDTH,
-                        fov: float = CAMERA_FOV_DEG) -> List[float]:
+def angle_diff_deg(a: float, b: float) -> float:
+    """返回两个角度（度）之间的最小差值。"""
+    d = abs(a - b) % 360.0
+    return float(min(d, 360.0 - d))
+
+
+def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
+                       img_height: int = IMAGE_HEIGHT,
+                       fov: float = CAMERA_FOV_DEG) -> List[float]:
     """
     theta 降级模式：
     - 用激光雷达 3D 中心计算其对应摄像头的水平角 theta_lidar
@@ -252,12 +263,14 @@ def theta_to_proj_bbox(det3d: Dict, det2d: Dict, img_width: int = IMAGE_WIDTH,
     f_approx = img_width / (2.0 * np.tan(fov_rad / 2.0))
     proj_w   = f_approx * det3d["dimensions"][1] / dist_xy  # 用激光雷达宽度
 
-    # 取投影宽度和 YOLO bbox 宽度的平均，减少极端情况
-    yolo_w  = det2d["bbox"][2] - det2d["bbox"][0]
-    half_w  = max((proj_w + yolo_w) / 4.0, 5.0)  # 至少 5px 防止退化
+    half_w  = max(proj_w / 2.0, 8.0)  # 至少 8px 防止退化
 
-    return [x_center - half_w, det2d["bbox"][1],
-            x_center + half_w, det2d["bbox"][3]]
+    # theta 模式下缺少可靠垂直信息，使用一个保守的默认高度占位
+    box_h = max(proj_w * 1.4, 20.0)
+    y2 = img_height * 0.85
+    y1 = y2 - box_h
+
+    return [x_center - half_w, y1, x_center + half_w, y2]
 
 # ============================================================
 # PART 5  卡尔曼滤波器（单目标）
@@ -382,6 +395,7 @@ def fuse(
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
+        include_unmatched_yolo: bool = False,
 ) -> List[Dict]:
 
     det3d = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
@@ -407,40 +421,62 @@ def fuse(
         mode_tag = "标定投影"
     else:
         # 降级模式：theta 粗估
-        proj_bboxes = [None] * len(det3d)   # 占位，匹配时用 theta_to_proj_bbox
+        proj_bboxes = [theta_to_proj_bbox(d) for d in det3d]
         mode_tag = "theta 粗估"
 
     logger.info(f"融合模式: {mode_tag}")
 
     n3, n2  = len(det3d), len(det2d)
     iou_mat = np.zeros((n3, n2))
+    sim_mat = np.zeros((n3, n2))
+    theta_diff_mat = np.full((n3, n2), np.inf)
     for i, d3 in enumerate(det3d):
         for j, d2 in enumerate(det2d):
             yolo_label = d2["label"]
             yolo_mapped = YOLO_TO_PVRCNN.get(yolo_label.lower(), "未映射")
             logger.info(f"YOLO: '{yolo_label}' -> '{yolo_mapped}' | 激光雷达: '{d3['label']}'")
-            # if not same_category_group(d2["label"], d3["label"]):
-            #     continue
+            if not same_category_group(d2["label"], d3["label"]):
+                continue
             if calib.use_calib:
                 if proj_bboxes[i] is None:
                     continue
                 ref_box = proj_bboxes[i]
+                iou = compute_iou_2d(ref_box, d2["bbox"])
+                iou_mat[i, j] = iou
+                sim_mat[i, j] = iou
             else:
-                # theta 降级模式：用激光雷达 center 计算投影角，再与 YOLO bbox 对比
-                ref_box = theta_to_proj_bbox(d3, d2)
+                # theta 降级模式：优先使用角度一致性做匹配，避免“都融合进去”
+                ref_box = proj_bboxes[i]
+                theta_lidar = lidar_center_to_theta(d3["center"])
+                theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
+                theta_diff_mat[i, j] = theta_diff
+                if theta_diff > THETA_MATCH_DEG:
+                    continue
+                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
+
+                # 再加入 x 方向中心对齐，抑制左右错配
+                est_x = (theta_lidar / CAMERA_FOV_DEG + 0.5) * IMAGE_WIDTH
+                yolo_x = (d2["bbox"][0] + d2["bbox"][2]) / 2.0
+                x_gap_norm = min(abs(est_x - yolo_x) / (IMAGE_WIDTH / 2.0), 1.0)
+                x_sim = 1.0 - x_gap_norm
+
+                sim = 0.75 * theta_sim + 0.25 * x_sim
+                sim_mat[i, j] = sim
 
             # 调试：打印具体数值
             logger.info(f"激光雷达 {i} ({d3['label']}): center={d3['center']}")
             logger.info(f"YOLO {j} ({d2['label']}): bbox={d2['bbox']}, theta={d2.get('theta', 0):.2f}")
             logger.info(f"估算投影框: {ref_box}")
+            if calib.use_calib:
+                logger.info(f"IoU: {iou_mat[i, j]:.3f}")
+            else:
+                logger.info(f"theta_diff={theta_diff_mat[i, j]:.2f}°, sim={sim_mat[i, j]:.3f}")
 
-            iou_mat[i, j] = compute_iou_2d(ref_box, d2["bbox"])
-            logger.info(f"IoU: {iou_mat[i, j]:.3f}")
-
-    row_ind, col_ind = linear_sum_assignment(-iou_mat)
+    match_mat = iou_mat if calib.use_calib else sim_mat
+    row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if iou_mat[r, c] >= IOU_THRESH
+        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -456,11 +492,13 @@ def fuse(
         if i in matched_3d:
             d2          = det2d[matched_3d[i]]
             yolo_conf   = d2["score"]
-            fused_score = w_pvrcnn * d3["score"] + w_yolo * yolo_conf
+            match_quality = iou_mat[i, matched_3d[i]] if calib.use_calib else sim_mat[i, matched_3d[i]]
+            fused_score = w_pvrcnn * d3["score"] + w_yolo * yolo_conf * match_quality
             matched     = True
         else:
             yolo_conf   = 0.0
             fused_score = w_pvrcnn * d3["score"]
+            match_quality = 0.0
             matched     = False
 
         if fused_score < fused_thresh:
@@ -476,14 +514,17 @@ def fuse(
             "proj_bbox"  : proj_bboxes[i],
             "matched_2d" : matched,
             "yolo_conf"  : round(yolo_conf, 4),
+            "match_quality": round(match_quality, 4),
             "fusion_mode": mode_tag,
             "timestamp"  : d3["timestamp"],
         })
 
-    # 添加未匹配的 YOLO 目标
+    # 仅在显式开启时添加未匹配 YOLO，并进行置信度过滤
     matched_2d = set(matched_3d.values())
-    for j, d2 in enumerate(det2d):
-        if j not in matched_2d:
+    if include_unmatched_yolo:
+        for j, d2 in enumerate(det2d):
+            if j in matched_2d or d2["score"] < UNMATCHED_YOLO_MIN_SCORE:
+                continue
             fused.append({
                 "label"      : YOLO_TO_PVRCNN.get(d2["label"].lower(), d2["label"]),
                 "score"      : round(d2["score"], 4),
@@ -494,6 +535,7 @@ def fuse(
                 "proj_bbox"  : d2["bbox"],
                 "matched_2d" : False,
                 "yolo_conf"  : round(d2["score"], 4),
+                "match_quality": 0.0,
                 "fusion_mode": mode_tag,
                 "timestamp"  : d2["timestamp"],
             })
