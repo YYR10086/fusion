@@ -39,7 +39,7 @@ FUSED_THRESH    = 0.1
 THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
-UNMATCHED_YOLO_MIN_SCORE = 0.6
+UNMATCHED_YOLO_MIN_SCORE = 0.25
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -418,6 +418,7 @@ def fuse(
         fused_thresh: float = FUSED_THRESH,
         include_unmatched_yolo: bool = False,
         camera_fov_only: bool = True,
+        unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
 
     det3d_all = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
@@ -434,9 +435,10 @@ def fuse(
 
     ts3 = det3d[0]["timestamp"]
     ts2 = det2d[0]["timestamp"] if det2d else ts3
+    allow_cross_sensor_match = True
     if not timestamps_aligned(ts3, ts2):
-        logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，跳过 YOLO 匹配")
-        det2d = []
+        logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅保留单传感器结果，不做跨传感器匹配")
+        allow_cross_sensor_match = False
 
     # 根据标定是否可用，选择投影方式
     if calib.use_calib:
@@ -459,6 +461,8 @@ def fuse(
     theta_diff_mat = np.full((n3, n2), np.inf)
     for i, d3 in enumerate(det3d):
         for j, d2 in enumerate(det2d):
+            if not allow_cross_sensor_match:
+                continue
             yolo_label = d2["label"]
             yolo_mapped = YOLO_TO_PVRCNN.get(yolo_label.lower(), "未映射")
             logger.info(f"YOLO: '{yolo_label}' -> '{yolo_mapped}' | 激光雷达: '{d3['label']}'")
@@ -551,12 +555,13 @@ def fuse(
     matched_2d = set(matched_3d.values())
     if include_unmatched_yolo:
         for j, d2 in enumerate(det2d):
-            if j in matched_2d or d2["score"] < UNMATCHED_YOLO_MIN_SCORE:
+            if j in matched_2d or d2["score"] < unmatched_yolo_min_score:
                 continue
             fused.append({
                 "label"      : YOLO_TO_PVRCNN.get(d2["label"].lower(), d2["label"]),
                 "score"      : round(d2["score"], 4),
-                "fused_score": round(w_yolo * d2["score"], 4),
+                # YOLO-only 目标不再按权重再压一层，避免在统计中被过度削弱
+                "fused_score": round(d2["score"], 4),
                 "center"     : [0, 0, 0],
                 "dimensions" : [0, 0, 0],
                 "heading"    : 0,

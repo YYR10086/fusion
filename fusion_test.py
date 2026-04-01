@@ -41,6 +41,7 @@ def main():
             calib,
             include_unmatched_yolo=True,
             camera_fov_only=True,
+            unmatched_yolo_min_score=0.2,
         )
 
         if fused:
