@@ -45,63 +45,52 @@ MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
 CALIB_PATH      = "calib.txt"# kitti格式标定文件路径
 
-YOLO_TO_PVRCNN: Dict[str, str] = {
-    "car"        : "Car",
-    "truck"      : "Car",
-    "bus"        : "Bus",
-    "van"        : "Car",
-    "motorcycle" : "Cyclist",
-    "bicycle"    : "Cyclist",
-    "person"     : "Pedestrian",
-    "rider"      : "Cyclist",
+CANONICAL_LABELS = {"car", "bus", "truck", "pedestrian", "cyclist"}
+
+# YOLO 原始标签 -> 统一标签
+YOLO_TO_CANONICAL: Dict[str, str] = {
+    "car": "car",
+    "truck": "truck",
+    "bus": "bus",
+    "van": "car",
+    "train": "truck",
+    "motorcycle": "cyclist",
+    "bicycle": "cyclist",
+    "person": "pedestrian",
+    "rider": "cyclist",
 }
 
-# 大类分组：同一 group 内允许跨细分类别匹配
-# 例如：激光雷达识别 Cyclist，摄像头识别 person，视为同一大类，允许匹配
-CATEGORY_GROUPS: List[set] = [
-    {"Car", "Bus", "Truck", "Van"},
-    {"Cyclist", "Pedestrian"},
-    {"person", "Pedestrian", "Cyclist"},   # YOLO person 可匹配激光雷达 Cyclist/Pedestrian
-]
+# PVRCNN 原始标签 -> 统一标签
+PVRCNN_TO_CANONICAL: Dict[str, str] = {
+    "car": "car",
+    "van": "car",
+    "bus": "bus",
+    "truck": "truck",
+    "pedestrian": "pedestrian",
+    "cyclist": "cyclist",
+}
 
-def same_category_group(yolo_label: str, pvrcnn_label: str) -> bool:
-    """判断 YOLO 标签和 PVRCNN 标签是否属于同一可匹配大类"""
-    mapped = YOLO_TO_PVRCNN.get(yolo_label.lower())
-    if mapped == pvrcnn_label:
-        return True
-    # 大类模糊匹配
-    for group in CATEGORY_GROUPS:
-        if pvrcnn_label in group:
-            if mapped in group or yolo_label in group:
-                return True
-    return False
+def normalize_yolo_label(label: str) -> str:
+    """将 YOLO 标签标准化为五大类之一；未知返回空字符串。"""
+    return YOLO_TO_CANONICAL.get(str(label).lower(), "")
 
-def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
-    """
-    类别兼容分数：
-    - 1.0：强一致（映射后完全一致）
-    - 0.6：同一大类（如 Pedestrian/Cyclist）
-    - 0.0：不兼容
-    """
-    mapped = YOLO_TO_PVRCNN.get(yolo_label.lower())
-    if mapped == pvrcnn_label:
-        return 1.0
-    if same_category_group(yolo_label, pvrcnn_label):
-        return 0.6
-    return 0.0
+def normalize_pvrcnn_label(label: str) -> str:
+    """将 PVRCNN 标签标准化为五大类之一；未知返回空字符串。"""
+    normalized = PVRCNN_TO_CANONICAL.get(str(label).lower(), "")
+    return normalized if normalized in CANONICAL_LABELS else ""
 
 def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
     """
     类别兼容分数：
     - 1.0：强一致（映射后完全一致）
-    - 0.6：同一大类（如 Pedestrian/Cyclist）
     - 0.0：不兼容
     """
-    mapped = YOLO_TO_PVRCNN.get(yolo_label.lower())
-    if mapped == pvrcnn_label:
+    yolo_norm = normalize_yolo_label(yolo_label)
+    pvrcnn_norm = normalize_pvrcnn_label(pvrcnn_label)
+    if not yolo_norm or not pvrcnn_norm:
+        return 0.0
+    if yolo_norm == pvrcnn_norm:
         return 1.0
-    if same_category_group(yolo_label, pvrcnn_label):
-        return 0.6
     return 0.0
 
 # ============================================================
@@ -235,7 +224,7 @@ def pvrcnn_to_unified(d: Dict) -> Dict:
     cx, cy, cz = d["box"]["center"]
     dx, dy, dz = d["box"]["dimensions"]
     return {
-        "label"     : d["class_label"],
+        "label"     : normalize_pvrcnn_label(d["class_label"]),
         "score"     : float(d["score"]),
         "center"    : [cx, cy, cz],
         "dimensions": [dx, dy, dz],
@@ -245,7 +234,7 @@ def pvrcnn_to_unified(d: Dict) -> Dict:
 
 def yolo_to_unified(d: Dict) -> Dict:
     return {
-        "label"    : d["label"],
+        "label"    : normalize_yolo_label(d["label"]),
         "score"    : float(d["score"]),
         "bbox"     : d["bbox_camera"],
         "theta"    : float(d.get("theta", 0.0)),
@@ -439,7 +428,9 @@ def fuse(
     det3d = det3d_all
     if camera_fov_only:
         det3d = [d for d in det3d if lidar_in_camera_fov(d["center"], CAMERA_FOV_DEG)]
-    det2d = [yolo_to_unified(d)   for d in yolo_raw]
+    det2d = [yolo_to_unified(d) for d in yolo_raw]
+    det3d = [d for d in det3d if d["label"]]
+    det2d = [d for d in det2d if d["label"]]
     if camera_fov_only:
         logger.info(f"PVRCNN FOV过滤: {len(det3d_all)} -> {len(det3d)}")
     logger.info(f"YOLO 原始数量: {len(yolo_raw)}")
@@ -478,7 +469,7 @@ def fuse(
             if not allow_cross_sensor_match:
                 continue
             yolo_label = d2["label"]
-            yolo_mapped = YOLO_TO_PVRCNN.get(yolo_label.lower(), "未映射")
+            yolo_mapped = normalize_yolo_label(yolo_label) or "未映射"
             logger.info(f"YOLO: '{yolo_label}' -> '{yolo_mapped}' | 激光雷达: '{d3['label']}'")
             compat = category_compatibility(d2["label"], d3["label"])
             if compat <= 0.0:
@@ -551,7 +542,7 @@ def fuse(
             continue
 
         fused.append({
-            "label"      : YOLO_TO_PVRCNN.get(det2d[matched_3d[i]]["label"].lower(), d3["label"]) if matched else d3["label"],
+            "label"      : (det2d[matched_3d[i]]["label"] if matched else d3["label"]),
             "score"      : round(d3["score"],  4),
             "fused_score": round(fused_score,  4),
             "center"     : d3["center"],
@@ -572,7 +563,7 @@ def fuse(
             if j in matched_2d or d2["score"] < unmatched_yolo_min_score:
                 continue
             fused.append({
-                "label"      : YOLO_TO_PVRCNN.get(d2["label"].lower(), d2["label"]),
+                "label"      : d2["label"],
                 "score"      : round(d2["score"], 4),
                 # YOLO-only 目标不再按权重再压一层，避免在统计中被过度削弱
                 "fused_score": round(d2["score"], 4),
