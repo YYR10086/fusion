@@ -19,6 +19,30 @@ CONF_THRESH  = 0.80# 置信度阈值
 FOV          = 150.0               # 摄像头水平视角（度）
 # ─────────────────────────────────────────────
 
+# 将 YOLO 原始细分类合并为统一大类，便于后续融合
+YOLO_LABEL_MERGE = {
+    # 车辆类
+    "car": "car",
+    "truck": "truck",
+    "bus": "bus",
+    "van": "car",
+    "train": "truck",
+    # 行人类
+    "person": "pedestrian",
+    # 骑行类
+    "bicycle": "cyclist",
+    "motorcycle": "cyclist",
+    "rider": "cyclist",
+}
+
+TARGET_CLASSES = {"car", "bus", "truck", "pedestrian", "cyclist"}
+
+
+def normalize_yolo_label(raw_label: str) -> str:
+    """将 YOLO 原始标签映射为统一标签，不在目标集合中的返回空字符串。"""
+    merged = YOLO_LABEL_MERGE.get(raw_label.lower(), "")
+    return merged if merged in TARGET_CLASSES else ""
+
 def compute_theta(bbox: list, img_width: int, fov: float = 150.0) -> float:
     """
     计算目标中心点偏离摄像头中轴线的角度theta。
@@ -107,7 +131,10 @@ def run_detection(
 
                 # 类别名称
                 cls_id = int(box.cls[0])
-                label  = model.names[cls_id]
+                raw_label = model.names[cls_id]
+                label = normalize_yolo_label(raw_label)
+                if not label:
+                    continue
 
                 # 偏角 theta
                 theta  = compute_theta(bbox, img_w, fov)

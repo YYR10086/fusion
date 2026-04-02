@@ -35,9 +35,12 @@ def main():
         "yolo_only_total": 0,
     }
 
-    for idx in range(min(len(yolo_frames), len(pvrcnn_frames))):
-        yolo_dets = yolo_frames[idx].get("detections", [])
-        pvrcnn_dets = pvrcnn_frames[idx].get("detections", [])
+    total_frames = max(len(yolo_frames), len(pvrcnn_frames))
+    for idx in range(total_frames):
+        yolo_frame = yolo_frames[idx] if idx < len(yolo_frames) else {}
+        pvrcnn_frame = pvrcnn_frames[idx] if idx < len(pvrcnn_frames) else {}
+        yolo_dets = yolo_frame.get("detections", [])
+        pvrcnn_dets = pvrcnn_frame.get("detections", [])
         stats["yolo_total"] += len(yolo_dets)
         stats["pvrcnn_total"] += len(pvrcnn_dets)
         stats["pvrcnn_in_fov"] += sum(
@@ -45,10 +48,13 @@ def main():
             if lidar_in_camera_fov(d["box"]["center"], CAMERA_FOV_DEG)
         )
 
-        if not pvrcnn_dets:
-            continue
+        if pvrcnn_dets:
+            timestamp = pvrcnn_dets[0].get("timestamp", "")
+        elif yolo_dets:
+            timestamp = yolo_dets[0].get("timestamp", "")
+        else:
+            timestamp = ""
 
-        timestamp = pvrcnn_dets[0].get("timestamp", "")
         fused = fuse(
             pvrcnn_dets,
             yolo_dets,
@@ -68,7 +74,7 @@ def main():
             tracked = mot.update(fused, timestamp)
             all_results.append({
                 "frame_id": idx,
-                "filename": pvrcnn_frames[idx].get("filename", ""),
+                "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
                 "detections": tracked
             })
 
