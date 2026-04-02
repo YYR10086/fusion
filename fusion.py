@@ -295,6 +295,17 @@ def lidar_in_strict_camera_view(center: List[float], fov: float = CAMERA_FOV_DEG
     theta = lidar_center_to_theta(center, fov=fov, clip_to_fov=False)
     return abs(theta) <= max((fov / 2.0) - margin_deg, 1.0)
 
+def lidar_in_strict_camera_view(center: List[float], fov: float = CAMERA_FOV_DEG,
+                                max_range_m: float = CAMERA_MAX_RANGE_M,
+                                margin_deg: float = CAMERA_FOV_MARGIN_DEG) -> bool:
+    """更严格的可见性约束：同时满足角度和距离。"""
+    x, y, _ = center
+    dist_xy = float(np.hypot(x, y))
+    if dist_xy > max_range_m:
+        return False
+    theta = lidar_center_to_theta(center, fov=fov, clip_to_fov=False)
+    return abs(theta) <= max((fov / 2.0) - margin_deg, 1.0)
+
 
 def angle_diff_deg(a: float, b: float) -> float:
     """返回两个角度（度）之间的最小差值。"""
@@ -330,6 +341,44 @@ def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
     y1 = y2 - box_h
 
     return [x_center - half_w, y1, x_center + half_w, y2]
+
+def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
+                             max_theta_diff: float = THETA_MATCH_DEG) -> Optional[Dict]:
+    """基于 YOLO 角度在激光雷达结果中查找最近目标，作为提示信息。"""
+    best = None
+    best_diff = float("inf")
+    for d3 in det3d:
+        if d3["label"] != yolo_det["label"]:
+            continue
+        theta_lidar = lidar_center_to_theta(d3["center"])
+        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        if diff < best_diff:
+            best_diff = diff
+            best = d3
+    if best is None or best_diff > max_theta_diff:
+        return None
+    return {"det3d": best, "theta_diff": best_diff}
+
+def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
+    """
+    当 YOLO 置信度很高且当前无匹配激光雷达时，估计一个保守 3D 目标，
+    仅作为提示，不覆盖激光雷达结果。
+    """
+    label = yolo_det["label"]
+    dims = CLASS_SIZE_PRIOR.get(label, [4.0, 1.8, 1.6])
+    bbox = yolo_det["bbox"]
+    pix_h = max(bbox[3] - bbox[1], 1.0)
+    # 经验距离估计：高像素高度 -> 近；低像素高度 -> 远
+    est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
+    theta_deg = yolo_det.get("theta", 0.0)
+    theta_rad = np.radians(theta_deg)
+    x = est_range * np.cos(theta_rad)
+    y = est_range * np.sin(theta_rad)
+    return {
+        "center": [round(float(x), 3), round(float(y), 3), 0.0],
+        "dimensions": dims,
+        "heading": float(theta_rad),
+    }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
                              max_theta_diff: float = THETA_MATCH_DEG) -> Optional[Dict]:
@@ -743,45 +792,49 @@ def fuse(
 
     # 仅在显式开启时添加未匹配 YOLO，并进行置信度过滤
     matched_2d = set(matched_3d.values())
-    if include_unmatched_yolo:
-        for j, d2 in enumerate(det2d):
-            if j in matched_2d or d2["score"] < unmatched_yolo_min_score:
-                continue
-            lidar_hint = find_lidar_hint_by_theta(d2, det3d)
-            if lidar_hint is not None:
-                # 有角度邻近激光雷达目标时，直接借用其3D位置，仅做标签提示
-                hint_det = lidar_hint["det3d"]
-                center = hint_det["center"]
-                dims = hint_det["dimensions"]
-                heading = hint_det["heading"]
-                source = "yolo_hint_lidar"
-            elif d2["score"] >= YOLO_HIGH_CONF_THRESH:
-                est_3d = estimate_yolo_only_3d(d2)
-                center = est_3d["center"]
-                dims = est_3d["dimensions"]
-                heading = est_3d["heading"]
-                source = "yolo_estimated"
-            else:
-                center = [0, 0, 0]
-                dims = [0, 0, 0]
-                heading = 0
-                source = "yolo_only"
-            fused.append({
-                "label"      : d2["label"],
-                "score"      : round(d2["score"], 4),
-                # YOLO 仅做提示：默认低于 PVRCNN 主结果
-                "fused_score": round(min(d2["score"] * 0.7, 0.69), 4),
-                "center"     : center,
-                "dimensions" : dims,
-                "heading"    : heading,
-                "proj_bbox"  : d2["bbox"],
-                "matched_2d" : False,
-                "yolo_conf"  : round(d2["score"], 4),
-                "match_quality": 0.0,
-                "fusion_mode": mode_tag,
-                "timestamp"  : d2["timestamp"],
-                "source"     : source,
-            })
+    for j, d2 in enumerate(det2d):
+        if j in matched_2d:
+            continue
+        # include_unmatched_yolo=False 时，仍保留高置信 YOLO 估计，避免漏检
+        if (not include_unmatched_yolo) and d2["score"] < YOLO_HIGH_CONF_THRESH:
+            continue
+        if d2["score"] < unmatched_yolo_min_score:
+            continue
+        lidar_hint = find_lidar_hint_by_theta(d2, det3d)
+        if lidar_hint is not None:
+            # 有角度邻近激光雷达目标时，直接借用其3D位置，仅做标签提示
+            hint_det = lidar_hint["det3d"]
+            center = hint_det["center"]
+            dims = hint_det["dimensions"]
+            heading = hint_det["heading"]
+            source = "yolo_hint_lidar"
+        elif d2["score"] >= YOLO_HIGH_CONF_THRESH:
+            est_3d = estimate_yolo_only_3d(d2)
+            center = est_3d["center"]
+            dims = est_3d["dimensions"]
+            heading = est_3d["heading"]
+            source = "yolo_estimated"
+        else:
+            center = [0, 0, 0]
+            dims = [0, 0, 0]
+            heading = 0
+            source = "yolo_only"
+        fused.append({
+            "label"      : d2["label"],
+            "score"      : round(d2["score"], 4),
+            # YOLO 仅做提示：默认低于 PVRCNN 主结果
+            "fused_score": round(min(d2["score"] * 0.7, 0.69), 4),
+            "center"     : center,
+            "dimensions" : dims,
+            "heading"    : heading,
+            "proj_bbox"  : d2["bbox"],
+            "matched_2d" : False,
+            "yolo_conf"  : round(d2["score"], 4),
+            "match_quality": 0.0,
+            "fusion_mode": mode_tag,
+            "timestamp"  : d2["timestamp"],
+            "source"     : source,
+        })
 
     fused.sort(key=lambda x: x["fused_score"], reverse=True)
     return fused
