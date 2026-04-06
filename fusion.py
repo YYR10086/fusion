@@ -46,6 +46,13 @@ THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
 STRICT_THETA_SIM_THRESH = 0.42    # 精度优先：theta 模式匹配阈值更严格
 CAR_THETA_SIM_THRESH = 0.38       # car 略放宽，但避免过低阈值引入误检
+FAR_RANGE_THETA_SIGMA_DEG = 9.0
+NEAR_RANGE_THETA_SIGMA_DEG = 4.5
+MOTION_GATING_DIST_M = 4.0
+MOTION_QUALITY_SIGMA_M = 2.0
+MOTION_QUALITY_WEIGHT = 0.25
+GEOMETRY_QUALITY_WEIGHT = 0.20
+THETA_QUALITY_WEIGHT = 0.55
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
@@ -364,6 +371,59 @@ def angle_diff_deg(a: float, b: float) -> float:
     """返回两个角度（度）之间的最小差值。"""
     d = abs(a - b) % 360.0
     return float(min(d, 360.0 - d))
+
+
+def dynamic_theta_sigma_by_range(center: List[float]) -> float:
+    """距离越远，角度噪声越大，适当放宽匹配 sigma。"""
+    x, y, _ = center
+    dist = float(np.hypot(x, y))
+    ratio = float(np.clip(dist / max(CAMERA_MAX_RANGE_M, 1.0), 0.0, 1.0))
+    return float(
+        NEAR_RANGE_THETA_SIGMA_DEG +
+        (FAR_RANGE_THETA_SIGMA_DEG - NEAR_RANGE_THETA_SIGMA_DEG) * ratio
+    )
+
+
+def bbox_width(bbox: Optional[List[float]]) -> float:
+    if bbox is None:
+        return 0.0
+    return max(float(bbox[2] - bbox[0]), 0.0)
+
+
+def geometry_similarity_score(proj_bbox: Optional[List[float]], yolo_bbox: List[float]) -> float:
+    """
+    几何一致性：比较投影框与YOLO框宽度，抑制明显尺度不一致的误配。
+    返回 [0, 1]，1 表示宽度接近。
+    """
+    proj_w = bbox_width(proj_bbox)
+    yolo_w = bbox_width(yolo_bbox)
+    if proj_w < 1e-3 or yolo_w < 1e-3:
+        return 0.0
+    rel_err = abs(proj_w - yolo_w) / max(proj_w, yolo_w, 1e-6)
+    return float(np.exp(-3.0 * rel_err))
+
+
+def motion_prior_score(
+        center: List[float],
+        label: str,
+        motion_predictions: Optional[List[Dict]],
+) -> float:
+    """
+    卡尔曼预测先验：当前检测与预测位置越接近，先验越高。
+    """
+    if not motion_predictions:
+        return 0.0
+    candidates = [p for p in motion_predictions if p.get("label") == label]
+    if not candidates:
+        return 0.0
+    cx, cy = float(center[0]), float(center[1])
+    min_dist = min(
+        float(np.hypot(cx - p["pred_center"][0], cy - p["pred_center"][1]))
+        for p in candidates
+    )
+    if min_dist > MOTION_GATING_DIST_M:
+        return 0.0
+    return float(np.exp(-(min_dist ** 2) / (2 * (MOTION_QUALITY_SIGMA_M ** 2))))
 
 
 def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
@@ -687,6 +747,24 @@ class MultiObjectTracker:
         smoothed.sort(key=lambda x: x["fused_score"], reverse=True)
         return smoothed
 
+    def predict_states(self, timestamp: str, label: Optional[str] = None) -> List[Dict]:
+        """
+        输出当前时刻的卡尔曼预测状态（不改变 miss_count），用于融合阶段先验约束。
+        """
+        states = []
+        for trk in self.tracks:
+            if label is not None and trk.label != label:
+                continue
+            pred = trk.predict(timestamp)
+            vx, vy = trk.get_velocity()
+            states.append({
+                "track_id": trk.track_id,
+                "label": trk.label,
+                "pred_center": [float(pred[0]), float(pred[1])],
+                "velocity": [float(vx), float(vy)],
+            })
+        return states
+
     def _new_track(self, d: Dict, ts: str) -> KalmanTracker:
         trk = KalmanTracker(d["center"][0], d["center"][1], d["label"], ts)
         self.tracks.append(trk)
@@ -705,6 +783,7 @@ def fuse(
         pvrcnn_raw  : List[Dict],
         yolo_raw    : List[Dict],
         calib       : KITTICalib,
+        motion_predictions: Optional[List[Dict]] = None,
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
@@ -712,7 +791,7 @@ def fuse(
         camera_fov_only: bool = False,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
-    del include_unmatched_yolo, unmatched_yolo_min_score  # 新策略：YOLO-only 一律不输出
+    del include_unmatched_yolo, unmatched_yolo_min_score, w_pvrcnn, w_yolo, camera_fov_only
 
     det3d = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
     det2d = [yolo_to_unified(d) for d in yolo_raw]
@@ -749,16 +828,24 @@ def fuse(
 
         if allow_cross_sensor_match:
             theta_lidar = lidar_center_to_theta(d3["center"])
+            theta_sigma = dynamic_theta_sigma_by_range(d3["center"])
+            motion_quality = motion_prior_score(d3["center"], d3["label"], motion_predictions)
             for j, d2 in enumerate(det2d):
                 if d2["label"] != d3["label"]:
                     continue
                 theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
                 if theta_diff > THETA_MATCH_DEG:
                     continue
-                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
-                quality = theta_sim
+                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * theta_sigma ** 2)))
+                geom_sim = geometry_similarity_score(proj_bboxes[i], d2["bbox"])
+                quality = (
+                    THETA_QUALITY_WEIGHT * theta_sim +
+                    GEOMETRY_QUALITY_WEIGHT * geom_sim +
+                    MOTION_QUALITY_WEIGHT * motion_quality
+                )
                 if calib.use_calib and proj_bboxes[i] is not None:
-                    quality = max(quality, compute_iou_2d(proj_bboxes[i], d2["bbox"]))
+                    iou_sim = compute_iou_2d(proj_bboxes[i], d2["bbox"])
+                    quality = max(quality, 0.65 * iou_sim + 0.35 * quality)
 
                 cls_thresh = CAR_THETA_SIM_THRESH if d3["label"] == "car" else STRICT_THETA_SIM_THRESH
                 if quality >= cls_thresh and quality > best_quality:
@@ -820,6 +907,7 @@ def fuse(
             "yolo_assisted": matched,  # 明确仅辅助，不产生独立输出
             "yolo_conf": round(best_yolo_conf if matched else 0.0, 4),
             "match_quality": round(best_quality if matched else 0.0, 4),
+            "motion_prior": round(motion_prior_score(d3["center"], d3["label"], motion_predictions), 4),
             "fusion_mode": mode_tag,
             "timestamp": d3["timestamp"],
             "source": "pvrcnn",
