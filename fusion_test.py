@@ -5,6 +5,7 @@ from fusion import process_frame, KITTICalib, MultiObjectTracker, fuse, lidar_in
 YOLO_JSON = "./record_output/record_output5/detection_results.json"
 PVRCNN_JSON = "./record_output/record_output5/lidar_detection_results.json"
 OUTPUT_JSON = "./record_output/record_output5/fusion_results.json"
+USE_TRACKING = False  # 评估融合质量时建议关闭，避免跟踪器影响检测指标
 
 
 def load_json(path):
@@ -86,7 +87,7 @@ def main():
         )
 
         if fused:
-            tracked = mot.update(fused, timestamp)
+            tracked = mot.update(fused, timestamp) if USE_TRACKING else fused
             all_results.append({
                 "frame_id": idx,
                 "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
@@ -97,6 +98,7 @@ def main():
         "meta": {
             "total_frames": len(all_results),
             "fusion_mode": "calib" if calib.use_calib else "theta",
+            "use_tracking": USE_TRACKING,
             "stats": stats,
         },
         "frames": all_results
