@@ -51,13 +51,18 @@ YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
 PVRCNN_MIN_KEEP_SCORE = 0.0       # 兼容旧参数（当前由分类别阈值控制）
 PVRCNN_KEEP_THRESH = {
-    "car": 0.26,
-    "truck": 0.30,
+    "car": 0.20,
+    "truck": 0.25,
     "bus": 0.75,          # bus 由更严格逻辑控制
-    "pedestrian": 0.20,
-    "cyclist": 0.16,
+    "pedestrian": 0.12,
+    "cyclist": 0.10,
 }
-PVRCNN_VISIBLE_UNMATCHED_PENALTY = 0.08  # 相机可见但未匹配时提高保留阈值，降低误检
+PVRCNN_VISIBLE_UNMATCHED_PENALTY = 0.00
+LOW_CONF_UNMATCHED_DROP_THRESH = {
+    "car": 0.28,
+    "pedestrian": 0.24,
+    "cyclist": 0.20,
+}
 CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
 CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
 CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
@@ -771,6 +776,15 @@ def fuse(
         if d3.get("camera_visible", True) and (not matched):
             min_keep += PVRCNN_VISIBLE_UNMATCHED_PENALTY
         if d3["score"] < min_keep:
+            continue
+        # 对关键类别仅抑制“低分且未被YOLO确认”的可见目标，减少误检同时避免过度丢检
+        low_conf_drop = LOW_CONF_UNMATCHED_DROP_THRESH.get(d3["label"])
+        if (
+            low_conf_drop is not None
+            and d3.get("camera_visible", True)
+            and (not matched)
+            and d3["score"] < low_conf_drop
+        ):
             continue
 
         # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
