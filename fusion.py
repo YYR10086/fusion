@@ -1150,14 +1150,6 @@ def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
         if d.get("matched_2d"):
             min_quality = STRICT_IOU_MATCH_THRESH if d.get("fusion_mode") == "标定投影" else STRICT_THETA_SIM_THRESH
             if d.get("match_quality", 0.0) < min_quality:
-                # 精度优先但不丢 LiDAR 目标：降级为 LiDAR-only，而不是直接丢弃
-                downgraded = dict(d)
-                downgraded["matched_2d"] = False
-                downgraded["yolo_conf"] = 0.0
-                downgraded["match_quality"] = 0.0
-                downgraded["source"] = "pvrcnn_strict_downgraded"
-                downgraded["fused_score"] = round(downgraded["score"] * W_PVRCNN, 4)
-                strict_fused.append(downgraded)
                 continue
         strict_fused.append(d)
 
