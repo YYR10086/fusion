@@ -72,7 +72,7 @@ def main():
             calib,
             # 与当前融合策略保持一致：YOLO 仅辅助，不输出 YOLO-only 目标
             include_unmatched_yolo=False,
-            camera_fov_only=True,
+            camera_fov_only=False,
         )
         stats["fused_total"] += len(fused)
         stats["matched_2d_total"] += sum(1 for d in fused if d.get("matched_2d"))

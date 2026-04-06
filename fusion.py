@@ -51,18 +51,14 @@ YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
 PVRCNN_MIN_KEEP_SCORE = 0.0       # 兼容旧参数（当前由分类别阈值控制）
 PVRCNN_KEEP_THRESH = {
-    "car": 0.20,
-    "truck": 0.25,
+    "car": 0.00,
+    "truck": 0.00,
     "bus": 0.75,          # bus 由更严格逻辑控制
-    "pedestrian": 0.12,
-    "cyclist": 0.10,
+    "pedestrian": 0.00,
+    "cyclist": 0.00,
 }
 PVRCNN_VISIBLE_UNMATCHED_PENALTY = 0.00
-LOW_CONF_UNMATCHED_DROP_THRESH = {
-    "car": 0.28,
-    "pedestrian": 0.24,
-    "cyclist": 0.20,
-}
+LOW_CONF_UNMATCHED_DROP_THRESH = {}
 CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
 CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
 CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
@@ -706,7 +702,7 @@ def fuse(
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
         include_unmatched_yolo: bool = False,
-        camera_fov_only: bool = True,
+        camera_fov_only: bool = False,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
     del include_unmatched_yolo, unmatched_yolo_min_score  # 新策略：YOLO-only 一律不输出
@@ -889,6 +885,7 @@ def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
         yolo_raw,
         calib,
         include_unmatched_yolo=False,
+        camera_fov_only=False,
     )
     if not fused:
         return []
