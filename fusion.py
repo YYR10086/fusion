@@ -693,14 +693,14 @@ def fuse(
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
     if camera_fov_only:
+        # 关键修复：不再因相机可见性直接删除 LiDAR 目标（尤其是 cyclist）
+        # camera_visible 仅用于“是否参与跨模态匹配”，不影响 LiDAR 主输出保留
         det3d_with_vis = []
         for d in det3d:
-            visible = lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)
-            if visible or d["score"] >= PVRCNN_HIGH_CONF_KEEP:
-                d2 = dict(d)
-                d2["camera_visible"] = visible
-                det3d_with_vis.append(d2)
-        logger.info(f"PVRCNN FOV过滤(保留高置信): {len(det3d)} -> {len(det3d_with_vis)}")
+            d2 = dict(d)
+            d2["camera_visible"] = lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)
+            det3d_with_vis.append(d2)
+        logger.info(f"PVRCNN 保留全部目标，仅标注 camera_visible: {len(det3d)} -> {len(det3d_with_vis)}")
         det3d = det3d_with_vis
     else:
         det3d = [dict(d, camera_visible=True) for d in det3d]
