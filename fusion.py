@@ -45,14 +45,15 @@ MIN_THETA_SIM   = 0.35
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
-DISABLE_BUS_CLASS = True                  # 当前数据集无 bus 类时建议开启
-BUS_FALLBACK_LABEL = "car"                # bus 统一并入 car（当前 car 类表现更稳定）
-PEDESTRIAN_UNMATCHED_YOLO_MIN_SCORE = 0.18
-PEDESTRIAN_THETA_MATCH_DEG = 14.0         # 行人匹配放宽角度门限
-PEDESTRIAN_MIN_THETA_SIM = 0.25           # 行人匹配放宽相似度阈值
-PER_CLASS_FUSION_WEIGHT = {
-    "pedestrian": (0.75, 0.25),           # 行人更依赖 YOLO，提升召回
+DEFAULT_INCLUDE_UNMATCHED_YOLO = False
+CAMERA_ONLY_CLASS_CFG: Dict[str, Dict[str, float]] = {
+    "car": {"min_score": 0.68, "min_streak": 2},        # 车辆宽松
+    "truck": {"min_score": 0.78, "min_streak": 2},
+    "bus": {"min_score": 0.82, "min_streak": 2},
+    "pedestrian": {"min_score": 0.90, "min_streak": 3}, # 行人严格
+    "cyclist": {"min_score": 0.90, "min_streak": 3},    # 骑行者严格
 }
+CAMERA_ONLY_MAX_THETA_GAP_DEG = 4.0
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -96,28 +97,12 @@ CLASS_SIZE_PRIOR: Dict[str, List[float]] = {
 
 def normalize_yolo_label(label: str) -> str:
     """将 YOLO 标签标准化为五大类之一；未知返回空字符串。"""
-    normalized = YOLO_TO_CANONICAL.get(str(label).lower(), "")
-    if DISABLE_BUS_CLASS and normalized == "bus":
-        return BUS_FALLBACK_LABEL
-    return normalized
+    return YOLO_TO_CANONICAL.get(str(label).lower(), "")
 
 def normalize_pvrcnn_label(label: str) -> str:
     """将 PVRCNN 标签标准化为五大类之一；未知返回空字符串。"""
     normalized = PVRCNN_TO_CANONICAL.get(str(label).lower(), "")
-    if DISABLE_BUS_CLASS and normalized == "bus":
-        normalized = BUS_FALLBACK_LABEL
     return normalized if normalized in CANONICAL_LABELS else ""
-
-def theta_match_gate_deg(label: str) -> float:
-    return PEDESTRIAN_THETA_MATCH_DEG if label == "pedestrian" else THETA_MATCH_DEG
-
-def theta_sim_threshold(label: str) -> float:
-    return PEDESTRIAN_MIN_THETA_SIM if label == "pedestrian" else MIN_THETA_SIM
-
-def per_class_unmatched_yolo_thresh(label: str, default_thresh: float) -> float:
-    if label == "pedestrian":
-        return min(default_thresh, PEDESTRIAN_UNMATCHED_YOLO_MIN_SCORE)
-    return default_thresh
 
 def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
     """
@@ -704,7 +689,7 @@ def fuse(
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
-        include_unmatched_yolo: bool = True,
+        include_unmatched_yolo: bool = DEFAULT_INCLUDE_UNMATCHED_YOLO,
         camera_fov_only: bool = True,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
@@ -732,8 +717,7 @@ def fuse(
         # 没有可用 LiDAR 时，直接返回 YOLO 提示结果（高置信可估计3D）
         yolo_only_fused = []
         for d2 in det2d:
-            min_unmatched_score = per_class_unmatched_yolo_thresh(d2["label"], unmatched_yolo_min_score)
-            if d2["score"] < min_unmatched_score:
+            if d2["score"] < unmatched_yolo_min_score:
                 continue
             if d2["score"] >= YOLO_HIGH_CONF_THRESH:
                 est_3d = estimate_yolo_only_3d(d2)
@@ -844,7 +828,7 @@ def fuse(
                 theta_lidar = lidar_center_to_theta(d3["center"])
                 theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
                 theta_diff_mat[i, j] = theta_diff
-                if theta_diff > theta_match_gate_deg(d3["label"]):
+                if theta_diff > THETA_MATCH_DEG:
                     continue
                 theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
 
@@ -870,8 +854,7 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib
-            else sim_mat[r, c] >= theta_sim_threshold(det3d[r]["label"]))
+        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -888,9 +871,8 @@ def fuse(
             d2          = det2d[matched_3d[i]]
             yolo_conf   = d2["score"]
             match_quality = iou_mat[i, matched_3d[i]] if calib.use_calib else sim_mat[i, matched_3d[i]]
-            cls_w_pv, cls_w_yolo = PER_CLASS_FUSION_WEIGHT.get(d3["label"], (w_pvrcnn, w_yolo))
             # 激光雷达主导：高置信度 PVRCNN 不会被 YOLO 明显拉低
-            fused_score = d3["score"] * cls_w_pv + (yolo_conf * match_quality) * cls_w_yolo
+            fused_score = d3["score"] * w_pvrcnn + (yolo_conf * match_quality) * w_yolo
             matched     = True
         else:
             yolo_conf   = 0.0
@@ -926,8 +908,7 @@ def fuse(
         # include_unmatched_yolo=False 时，仍保留高置信 YOLO 估计，避免漏检
         if (not include_unmatched_yolo) and d2["score"] < YOLO_HIGH_CONF_THRESH:
             continue
-        min_unmatched_score = per_class_unmatched_yolo_thresh(d2["label"], unmatched_yolo_min_score)
-        if d2["score"] < min_unmatched_score:
+        if d2["score"] < unmatched_yolo_min_score:
             continue
         lidar_hint = find_lidar_hint_by_theta(d2, det3d)
         if lidar_hint is not None:
@@ -1024,14 +1005,105 @@ def visualize_bev(
 # PART 9  主函数
 # ============================================================
 mot = MultiObjectTracker()
+camera_only_memory: List[Dict] = []
+
+def _candidate_theta(det: Dict) -> float:
+    center = det.get("center", [0, 0, 0])
+    if isinstance(center, list) and len(center) >= 2 and (abs(center[0]) + abs(center[1]) > 1e-3):
+        return lidar_center_to_theta(center, clip_to_fov=False)
+    bbox = det.get("proj_bbox")
+    if bbox:
+        x_center = (bbox[0] + bbox[2]) / 2.0
+        return float((x_center / IMAGE_WIDTH - 0.5) * CAMERA_FOV_DEG)
+    return 0.0
+
+def confirm_camera_only_detections(candidates: List[Dict], timestamp: str) -> List[Dict]:
+    """
+    Camera-only 目标确认：
+    - 单帧不输出；
+    - 连续多帧命中后输出；
+    - 车辆阈值宽松，行人/骑行者阈值严格。
+    """
+    global camera_only_memory
+    for m in camera_only_memory:
+        m["updated"] = False
+
+    for d in candidates:
+        label = d["label"]
+        cfg = CAMERA_ONLY_CLASS_CFG.get(label, {"min_score": YOLO_HIGH_CONF_THRESH, "min_streak": 2})
+        if d.get("score", 0.0) < cfg["min_score"]:
+            continue
+        if d.get("center", [0, 0, 0]) == [0, 0, 0]:
+            continue
+
+        theta = _candidate_theta(d)
+        best_idx = -1
+        best_gap = float("inf")
+        for idx, mem in enumerate(camera_only_memory):
+            if mem["label"] != label:
+                continue
+            gap = angle_diff_deg(theta, mem["theta"])
+            if gap <= CAMERA_ONLY_MAX_THETA_GAP_DEG and gap < best_gap:
+                best_gap = gap
+                best_idx = idx
+
+        if best_idx >= 0:
+            mem = camera_only_memory[best_idx]
+            mem["theta"] = theta
+            mem["streak"] += 1
+            mem["updated"] = True
+            mem["det"] = dict(d)
+            mem["last_ts"] = timestamp
+        else:
+            camera_only_memory.append({
+                "label": label,
+                "theta": theta,
+                "streak": 1,
+                "updated": True,
+                "det": dict(d),
+                "last_ts": timestamp,
+            })
+
+    confirmed: List[Dict] = []
+    kept: List[Dict] = []
+    for mem in camera_only_memory:
+        if not mem["updated"]:
+            continue
+        cfg = CAMERA_ONLY_CLASS_CFG.get(mem["label"], {"min_score": YOLO_HIGH_CONF_THRESH, "min_streak": 2})
+        if mem["streak"] >= cfg["min_streak"]:
+            out = dict(mem["det"])
+            out["source"] = "camera_confirmed"
+            out["fusion_mode"] = "camera_confirmed"
+            confirmed.append(out)
+        kept.append(mem)
+    camera_only_memory = kept
+    return confirmed
 
 def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
                   calib: KITTICalib) -> List[Dict]:
     timestamp = pvrcnn_raw[0].get("timestamp", "") if pvrcnn_raw else ""
-    fused     = fuse(pvrcnn_raw, yolo_raw, calib)
+    if (not timestamp) and yolo_raw:
+        timestamp = yolo_raw[0].get("timestamp", "")
+
+    # 主输出以 LiDAR 3D 为主；YOLO-only 必须经过跨帧确认才输出
+    fused = fuse(
+        pvrcnn_raw,
+        yolo_raw,
+        calib,
+        include_unmatched_yolo=True,
+    )
     if not fused:
+        confirm_camera_only_detections([], timestamp)
         return []
-    return mot.update(fused, timestamp)
+
+    lidar_primary = [d for d in fused if not str(d.get("source", "")).startswith("yolo")]
+    camera_candidates = [d for d in fused if str(d.get("source", "")).startswith("yolo")]
+    camera_confirmed = confirm_camera_only_detections(camera_candidates, timestamp)
+
+    merged = lidar_primary + camera_confirmed
+    if not merged:
+        return []
+    return mot.update(merged, timestamp)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
