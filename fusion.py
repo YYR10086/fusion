@@ -406,12 +406,18 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -444,12 +450,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -482,12 +495,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -520,12 +540,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -558,12 +585,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 # ============================================================
