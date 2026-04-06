@@ -67,6 +67,12 @@ BUS_MIN_KEEP_SCORE = 0.75         # bus 误检较多时提高准入门槛
 BUS_MIN_MATCH_QUALITY = 0.70      # 需要较高跨模态质量才保留 bus
 BUS_MIN_YOLO_CONF = 0.85
 ENFORCE_PVRCNN_BASELINE = True    # 不允许融合结果比 PVRCNN 更差
+SUPPRESS_TRUCK = True             # 按需求抑制 truck
+SUPPRESS_BUS = True               # 按需求抑制 bus
+SUPPRESS_REQUIRE_YOLO_CONFIRM = True
+SUPPRESS_RELEASE_YOLO_CONF = 0.90
+SUPPRESS_RELEASE_MATCH_QUALITY = 0.80
+APPLY_TRACKING = False            # 评估准确率时默认关闭卡尔曼后处理
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -718,11 +724,8 @@ def fuse(
     if not det3d:
         return []
 
-    # LiDAR 全保留，仅记录相机可见性（用于是否参与匹配）
-    if camera_fov_only:
-        det3d = [dict(d, camera_visible=lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)) for d in det3d]
-    else:
-        det3d = [dict(d, camera_visible=True) for d in det3d]
+    # 按需求移除“预计相机不可见”过滤：全部 LiDAR 目标都可参与后续流程
+    det3d = [dict(d, camera_visible=True) for d in det3d]
 
     ts3 = det3d[0]["timestamp"]
     ts2 = det2d[0]["timestamp"] if det2d else ts3
@@ -744,7 +747,7 @@ def fuse(
         best_yolo_conf = 0.0
         best_camera_label = ""
 
-        if allow_cross_sensor_match and d3.get("camera_visible", True):
+        if allow_cross_sensor_match:
             theta_lidar = lidar_center_to_theta(d3["center"])
             for j, d2 in enumerate(det2d):
                 if d2["label"] != d3["label"]:
@@ -785,15 +788,19 @@ def fuse(
             ):
                 continue
 
-        # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
-        if (not ENFORCE_PVRCNN_BASELINE) and ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
-            if d3["score"] < BUS_MIN_KEEP_SCORE:
+        # 抑制高风险类别：bus / truck（除非通过高置信 YOLO 强确认）
+        suppress_label = (
+            (SUPPRESS_BUS and d3["label"] == "bus")
+            or (SUPPRESS_TRUCK and d3["label"] == "truck")
+        )
+        if suppress_label:
+            if not SUPPRESS_REQUIRE_YOLO_CONFIRM:
                 continue
             if (
                 (not matched)
-                or best_quality < BUS_MIN_MATCH_QUALITY
-                or best_yolo_conf < BUS_MIN_YOLO_CONF
-                or best_camera_label != "bus"
+                or best_camera_label != d3["label"]
+                or best_yolo_conf < SUPPRESS_RELEASE_YOLO_CONF
+                or best_quality < SUPPRESS_RELEASE_MATCH_QUALITY
             ):
                 continue
 
@@ -891,6 +898,8 @@ def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
     )
     if not fused:
         return []
+    if not APPLY_TRACKING:
+        return fused
     return mot.update(fused, timestamp)
 
 def main():
