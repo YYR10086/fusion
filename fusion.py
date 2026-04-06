@@ -45,6 +45,14 @@ MIN_THETA_SIM   = 0.35
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
+DISABLE_BUS_CLASS = True                  # 当前数据集无 bus 类时建议开启
+BUS_FALLBACK_LABEL = "car"                # bus 统一并入 car（当前 car 类表现更稳定）
+PEDESTRIAN_UNMATCHED_YOLO_MIN_SCORE = 0.18
+PEDESTRIAN_THETA_MATCH_DEG = 14.0         # 行人匹配放宽角度门限
+PEDESTRIAN_MIN_THETA_SIM = 0.25           # 行人匹配放宽相似度阈值
+PER_CLASS_FUSION_WEIGHT = {
+    "pedestrian": (0.75, 0.25),           # 行人更依赖 YOLO，提升召回
+}
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -88,12 +96,28 @@ CLASS_SIZE_PRIOR: Dict[str, List[float]] = {
 
 def normalize_yolo_label(label: str) -> str:
     """将 YOLO 标签标准化为五大类之一；未知返回空字符串。"""
-    return YOLO_TO_CANONICAL.get(str(label).lower(), "")
+    normalized = YOLO_TO_CANONICAL.get(str(label).lower(), "")
+    if DISABLE_BUS_CLASS and normalized == "bus":
+        return BUS_FALLBACK_LABEL
+    return normalized
 
 def normalize_pvrcnn_label(label: str) -> str:
     """将 PVRCNN 标签标准化为五大类之一；未知返回空字符串。"""
     normalized = PVRCNN_TO_CANONICAL.get(str(label).lower(), "")
+    if DISABLE_BUS_CLASS and normalized == "bus":
+        normalized = BUS_FALLBACK_LABEL
     return normalized if normalized in CANONICAL_LABELS else ""
+
+def theta_match_gate_deg(label: str) -> float:
+    return PEDESTRIAN_THETA_MATCH_DEG if label == "pedestrian" else THETA_MATCH_DEG
+
+def theta_sim_threshold(label: str) -> float:
+    return PEDESTRIAN_MIN_THETA_SIM if label == "pedestrian" else MIN_THETA_SIM
+
+def per_class_unmatched_yolo_thresh(label: str, default_thresh: float) -> float:
+    if label == "pedestrian":
+        return min(default_thresh, PEDESTRIAN_UNMATCHED_YOLO_MIN_SCORE)
+    return default_thresh
 
 def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
     """
@@ -708,7 +732,8 @@ def fuse(
         # 没有可用 LiDAR 时，直接返回 YOLO 提示结果（高置信可估计3D）
         yolo_only_fused = []
         for d2 in det2d:
-            if d2["score"] < unmatched_yolo_min_score:
+            min_unmatched_score = per_class_unmatched_yolo_thresh(d2["label"], unmatched_yolo_min_score)
+            if d2["score"] < min_unmatched_score:
                 continue
             if d2["score"] >= YOLO_HIGH_CONF_THRESH:
                 est_3d = estimate_yolo_only_3d(d2)
@@ -819,7 +844,7 @@ def fuse(
                 theta_lidar = lidar_center_to_theta(d3["center"])
                 theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
                 theta_diff_mat[i, j] = theta_diff
-                if theta_diff > THETA_MATCH_DEG:
+                if theta_diff > theta_match_gate_deg(d3["label"]):
                     continue
                 theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
 
@@ -845,7 +870,8 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
+        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib
+            else sim_mat[r, c] >= theta_sim_threshold(det3d[r]["label"]))
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -862,8 +888,9 @@ def fuse(
             d2          = det2d[matched_3d[i]]
             yolo_conf   = d2["score"]
             match_quality = iou_mat[i, matched_3d[i]] if calib.use_calib else sim_mat[i, matched_3d[i]]
+            cls_w_pv, cls_w_yolo = PER_CLASS_FUSION_WEIGHT.get(d3["label"], (w_pvrcnn, w_yolo))
             # 激光雷达主导：高置信度 PVRCNN 不会被 YOLO 明显拉低
-            fused_score = d3["score"] * w_pvrcnn + (yolo_conf * match_quality) * w_yolo
+            fused_score = d3["score"] * cls_w_pv + (yolo_conf * match_quality) * cls_w_yolo
             matched     = True
         else:
             yolo_conf   = 0.0
@@ -899,7 +926,8 @@ def fuse(
         # include_unmatched_yolo=False 时，仍保留高置信 YOLO 估计，避免漏检
         if (not include_unmatched_yolo) and d2["score"] < YOLO_HIGH_CONF_THRESH:
             continue
-        if d2["score"] < unmatched_yolo_min_score:
+        min_unmatched_score = per_class_unmatched_yolo_thresh(d2["label"], unmatched_yolo_min_score)
+        if d2["score"] < min_unmatched_score:
             continue
         lidar_hint = find_lidar_hint_by_theta(d2, det3d)
         if lidar_hint is not None:
