@@ -37,6 +37,7 @@ IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
 IOU_THRESH      = 0.1
 STRICT_IOU_MATCH_THRESH = 0.15    # 精度优先：跨模态匹配阈值更严格
+CAR_IOU_MATCH_THRESH = 0.10       # car 适当放宽，提升 car 召回/F1
 W_PVRCNN        = 0.85
 W_YOLO          = 0.15
 FUSED_THRESH    = 0.1
@@ -44,6 +45,7 @@ THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
 STRICT_THETA_SIM_THRESH = 0.42    # 精度优先：theta 模式匹配阈值更严格
+CAR_THETA_SIM_THRESH = 0.35       # car 适当放宽，提升 car 召回/F1
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
@@ -847,8 +849,11 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= STRICT_IOU_MATCH_THRESH
-            if calib.use_calib else sim_mat[r, c] >= STRICT_THETA_SIM_THRESH)
+        if (
+            iou_mat[r, c] >= (CAR_IOU_MATCH_THRESH if det3d[r]["label"] == "car" else STRICT_IOU_MATCH_THRESH)
+            if calib.use_calib
+            else sim_mat[r, c] >= (CAR_THETA_SIM_THRESH if det3d[r]["label"] == "car" else STRICT_THETA_SIM_THRESH)
+        )
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -877,9 +882,16 @@ def fuse(
         if fused_score < fused_thresh:
             continue
 
+        camera_label = (det2d[matched_3d[i]]["label"] if matched else "")
+        # 车类标签策略：默认 LiDAR 主导；但当 camera 强匹配且给出 car 时，允许修正 truck/bus -> car
+        if matched and camera_label == "car" and d3["label"] in {"truck", "bus"} and match_quality >= 0.65:
+            final_label = "car"
+        else:
+            final_label = d3["label"]
+
         fused.append({
-            "label"      : d3["label"],  # 最终类别以 LiDAR 为主，减少视觉误分类
-            "camera_label": (det2d[matched_3d[i]]["label"] if matched else ""),
+            "label"      : final_label,
+            "camera_label": camera_label,
             "score"      : round(d3["score"],  4),
             "fused_score": round(fused_score,  4),
             "center"     : d3["center"],
