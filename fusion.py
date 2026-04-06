@@ -62,10 +62,11 @@ LOW_CONF_UNMATCHED_DROP_THRESH = {}
 CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
 CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
 CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
-ENABLE_BUS_SUPPRESSION = True
+ENABLE_BUS_SUPPRESSION = False
 BUS_MIN_KEEP_SCORE = 0.75         # bus 误检较多时提高准入门槛
 BUS_MIN_MATCH_QUALITY = 0.70      # 需要较高跨模态质量才保留 bus
 BUS_MIN_YOLO_CONF = 0.85
+ENFORCE_PVRCNN_BASELINE = True    # 不允许融合结果比 PVRCNN 更差
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -768,23 +769,24 @@ def fuse(
         fused_score = d3["score"]
 
         # 分类别最小置信度过滤：降低整体误检
-        min_keep = PVRCNN_KEEP_THRESH.get(d3["label"], PVRCNN_MIN_KEEP_SCORE)
-        if d3.get("camera_visible", True) and (not matched):
-            min_keep += PVRCNN_VISIBLE_UNMATCHED_PENALTY
-        if d3["score"] < min_keep:
-            continue
-        # 对关键类别仅抑制“低分且未被YOLO确认”的可见目标，减少误检同时避免过度丢检
-        low_conf_drop = LOW_CONF_UNMATCHED_DROP_THRESH.get(d3["label"])
-        if (
-            low_conf_drop is not None
-            and d3.get("camera_visible", True)
-            and (not matched)
-            and d3["score"] < low_conf_drop
-        ):
-            continue
+        if not ENFORCE_PVRCNN_BASELINE:
+            min_keep = PVRCNN_KEEP_THRESH.get(d3["label"], PVRCNN_MIN_KEEP_SCORE)
+            if d3.get("camera_visible", True) and (not matched):
+                min_keep += PVRCNN_VISIBLE_UNMATCHED_PENALTY
+            if d3["score"] < min_keep:
+                continue
+            # 对关键类别仅抑制“低分且未被YOLO确认”的可见目标，减少误检同时避免过度丢检
+            low_conf_drop = LOW_CONF_UNMATCHED_DROP_THRESH.get(d3["label"])
+            if (
+                low_conf_drop is not None
+                and d3.get("camera_visible", True)
+                and (not matched)
+                and d3["score"] < low_conf_drop
+            ):
+                continue
 
         # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
-        if ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
+        if (not ENFORCE_PVRCNN_BASELINE) and ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
             if d3["score"] < BUS_MIN_KEEP_SCORE:
                 continue
             if (
