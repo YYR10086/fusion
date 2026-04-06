@@ -1,11 +1,12 @@
 import json
-from fusion import process_frame, KITTICalib, MultiObjectTracker, fuse, lidar_in_camera_fov, CAMERA_FOV_DEG
+from fusion import KITTICalib, MultiObjectTracker, fuse, lidar_in_camera_fov, CAMERA_FOV_DEG
 
 # 路径配置
 YOLO_JSON = "./record_output/record_output5/detection_results.json"
 PVRCNN_JSON = "./record_output/record_output5/lidar_detection_results.json"
 OUTPUT_JSON = "./record_output/record_output5/fusion_results.json"
-USE_TRACKING = False  # 评估融合质量时建议关闭，避免跟踪器影响检测指标
+USE_TRACKING = False  # 输出层是否启用跟踪平滑
+USE_MOTION_PRIOR = True  # 融合层是否启用卡尔曼预测先验
 
 
 def load_json(path):
@@ -71,6 +72,9 @@ def main():
             pvrcnn_dets,
             yolo_dets,
             calib,
+            motion_predictions=(
+                mot.predict_states(timestamp) if (USE_MOTION_PRIOR and timestamp) else None
+            ),
             # 与当前融合策略保持一致：YOLO 仅辅助，不输出 YOLO-only 目标
             include_unmatched_yolo=False,
             camera_fov_only=False,
@@ -87,11 +91,12 @@ def main():
         )
 
         if fused:
-            tracked = mot.update(fused, timestamp) if USE_TRACKING else fused
+            tracked = mot.update(fused, timestamp) if timestamp else fused
+            output_dets = tracked if USE_TRACKING else fused
             all_results.append({
                 "frame_id": idx,
                 "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
-                "detections": tracked
+                "detections": output_dets
             })
 
     output = {
@@ -99,6 +104,7 @@ def main():
             "total_frames": len(all_results),
             "fusion_mode": "calib" if calib.use_calib else "theta",
             "use_tracking": USE_TRACKING,
+            "use_motion_prior": USE_MOTION_PRIOR,
             "stats": stats,
         },
         "frames": all_results
