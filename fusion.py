@@ -36,15 +36,40 @@ MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
 IOU_THRESH      = 0.1
+STRICT_IOU_MATCH_THRESH = 0.15    # 精度优先：跨模态匹配阈值更严格
+CAR_IOU_MATCH_THRESH = 0.12       # car 略放宽，但避免过低阈值引入误检
 W_PVRCNN        = 0.85
 W_YOLO          = 0.15
-FUSED_THRESH    = 0.1
+FUSED_THRESH    = 0.0
 THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
+STRICT_THETA_SIM_THRESH = 0.42    # 精度优先：theta 模式匹配阈值更严格
+CAR_THETA_SIM_THRESH = 0.38       # car 略放宽，但避免过低阈值引入误检
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
+PVRCNN_MIN_KEEP_SCORE = 0.0       # 兼容旧参数（当前由分类别阈值控制）
+PVRCNN_KEEP_THRESH = {
+    "car": 0.20,
+    "truck": 0.25,
+    "bus": 0.75,          # bus 由更严格逻辑控制
+    "pedestrian": 0.12,
+    "cyclist": 0.10,
+}
+PVRCNN_VISIBLE_UNMATCHED_PENALTY = 0.00
+LOW_CONF_UNMATCHED_DROP_THRESH = {
+    "car": 0.28,
+    "pedestrian": 0.24,
+    "cyclist": 0.20,
+}
+CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
+CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
+CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
+ENABLE_BUS_SUPPRESSION = True
+BUS_MIN_KEEP_SCORE = 0.75         # bus 误检较多时提高准入门槛
+BUS_MIN_MATCH_QUALITY = 0.70      # 需要较高跨模态质量才保留 bus
+BUS_MIN_YOLO_CONF = 0.85
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -680,261 +705,120 @@ def fuse(
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
-        include_unmatched_yolo: bool = True,
+        include_unmatched_yolo: bool = False,
         camera_fov_only: bool = True,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
+    del include_unmatched_yolo, unmatched_yolo_min_score  # 新策略：YOLO-only 一律不输出
 
-    det3d_all = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
-    det3d = det3d_all
+    det3d = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
     det2d = [yolo_to_unified(d) for d in yolo_raw]
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
+
+    # 仅保留高于最小置信度的 PVRCNN 目标（输出准入条件）
+    det3d = [d for d in det3d if d["score"] >= PVRCNN_MIN_KEEP_SCORE]
+    if not det3d:
+        return []
+
+    # LiDAR 全保留，仅记录相机可见性（用于是否参与匹配）
     if camera_fov_only:
-        det3d_with_vis = []
-        for d in det3d:
-            visible = lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)
-            if visible or d["score"] >= PVRCNN_HIGH_CONF_KEEP:
-                d2 = dict(d)
-                d2["camera_visible"] = visible
-                det3d_with_vis.append(d2)
-        logger.info(f"PVRCNN FOV过滤(保留高置信): {len(det3d)} -> {len(det3d_with_vis)}")
-        det3d = det3d_with_vis
+        det3d = [dict(d, camera_visible=lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)) for d in det3d]
     else:
         det3d = [dict(d, camera_visible=True) for d in det3d]
-    logger.info(f"YOLO 原始数量: {len(yolo_raw)}")
-    logger.info(f"YOLO 转换后数量: {len(det2d)}")
-    if not det3d:
-        # 没有可用 LiDAR 时，直接返回 YOLO 提示结果（高置信可估计3D）
-        yolo_only_fused = []
-        for d2 in det2d:
-            if d2["score"] < unmatched_yolo_min_score:
-                continue
-            if d2["score"] >= YOLO_HIGH_CONF_THRESH:
-                est_3d = estimate_yolo_only_3d(d2)
-                center = est_3d["center"]
-                dims = est_3d["dimensions"]
-                heading = est_3d["heading"]
-                source = "yolo_estimated"
-            else:
-                center = [0, 0, 0]
-                dims = [0, 0, 0]
-                heading = 0
-                source = "yolo_only"
-            yolo_only_fused.append({
-                "label": d2["label"],
-                "score": round(d2["score"], 4),
-                "fused_score": round(min(d2["score"] * 0.7, 0.69), 4),
-                "center": center,
-                "dimensions": dims,
-                "heading": heading,
-                "proj_bbox": d2["bbox"],
-                "matched_2d": False,
-                "yolo_conf": round(d2["score"], 4),
-                "match_quality": 0.0,
-                "fusion_mode": "yolo_only",
-                "timestamp": d2["timestamp"],
-                "source": source,
-                "camera_visible": True,
-            })
-        yolo_only_fused.sort(key=lambda x: x["fused_score"], reverse=True)
-        return yolo_only_fused
 
     ts3 = det3d[0]["timestamp"]
     ts2 = det2d[0]["timestamp"] if det2d else ts3
-    allow_cross_sensor_match = True
-    if not timestamps_aligned(ts3, ts2):
-        logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅保留单传感器结果，不做跨传感器匹配")
-        allow_cross_sensor_match = False
+    allow_cross_sensor_match = timestamps_aligned(ts3, ts2)
+    if not allow_cross_sensor_match:
+        logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅输出 PVRCNN")
 
-    # 根据标定是否可用，选择投影方式
-    if calib.use_calib:
-        # 精确模式：3D 框投影到图像平面
-        proj_bboxes = [
-            (calib.box3d_to_bbox2d(d["center"], d["dimensions"], d["heading"])
-             if d.get("camera_visible", True) else None)
-            for d in det3d
-        ]
-        mode_tag = "标定投影"
-    else:
-        # 降级模式：theta 粗估
-        proj_bboxes = [theta_to_proj_bbox(d) if d.get("camera_visible", True) else None for d in det3d]
-        mode_tag = "theta 粗估"
-
-    logger.info(f"融合模式: {mode_tag}")
-    if camera_fov_only:
-        vis_before = len(det3d)
-        if calib.use_calib:
-            pairs = [
-                (d, b) for d, b in zip(det3d, proj_bboxes)
-                if (not d.get("camera_visible", True)) or b is not None
-            ]
-            det3d = [d for d, _ in pairs]
-            proj_bboxes = [b for _, b in pairs]
-        else:
-            # theta模式下剔除预计投影过窄/超边界目标，减少“图上看不到但融合出了目标”
-            filtered = []
-            filtered_bbox = []
-            for d, box in zip(det3d, proj_bboxes):
-                if not d.get("camera_visible", True):
-                    filtered.append(d)
-                    filtered_bbox.append(None)
-                    continue
-                box_w = box[2] - box[0]
-                in_img = (box[2] > 0 and box[0] < IMAGE_WIDTH and box[3] > 0 and box[1] < IMAGE_HEIGHT)
-                if box_w >= MIN_VISIBLE_PIXEL_W and in_img:
-                    filtered.append(d)
-                    filtered_bbox.append(box)
-            det3d = filtered
-            proj_bboxes = filtered_bbox
-        logger.info(f"可见性过滤: {vis_before} -> {len(det3d)}")
-        if not det3d:
-            return []
-
-    n3, n2  = len(det3d), len(det2d)
-    iou_mat = np.zeros((n3, n2))
-    sim_mat = np.zeros((n3, n2))
-    theta_diff_mat = np.full((n3, n2), np.inf)
-    for i, d3 in enumerate(det3d):
-        for j, d2 in enumerate(det2d):
-            if not allow_cross_sensor_match:
-                continue
-            if not d3.get("camera_visible", True):
-                continue
-            yolo_label = d2["label"]
-            logger.info(f"YOLO: '{yolo_label}' | 激光雷达: '{d3['label']}'")
-            compat = category_compatibility(d2["label"], d3["label"])
-            if compat <= 0.0:
-                continue
-            if calib.use_calib:
-                if proj_bboxes[i] is None:
-                    continue
-                ref_box = proj_bboxes[i]
-                iou = compute_iou_2d(ref_box, d2["bbox"])
-                iou_mat[i, j] = iou
-                sim_mat[i, j] = iou * compat
-            else:
-                # theta 降级模式：优先使用角度一致性做匹配，避免“都融合进去”
-                ref_box = proj_bboxes[i]
-                theta_lidar = lidar_center_to_theta(d3["center"])
-                theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
-                theta_diff_mat[i, j] = theta_diff
-                if theta_diff > THETA_MATCH_DEG:
-                    continue
-                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
-
-                # 再加入 x 方向中心对齐，抑制左右错配
-                est_x = (theta_lidar / CAMERA_FOV_DEG + 0.5) * IMAGE_WIDTH
-                yolo_x = (d2["bbox"][0] + d2["bbox"][2]) / 2.0
-                x_gap_norm = min(abs(est_x - yolo_x) / (IMAGE_WIDTH / 2.0), 1.0)
-                x_sim = 1.0 - x_gap_norm
-
-                sim = (0.75 * theta_sim + 0.25 * x_sim) * compat
-                sim_mat[i, j] = sim
-
-            # 调试：打印具体数值
-            logger.info(f"激光雷达 {i} ({d3['label']}): center={d3['center']}")
-            logger.info(f"YOLO {j} ({d2['label']}): bbox={d2['bbox']}, theta={d2.get('theta', 0):.2f}")
-            logger.info(f"估算投影框: {ref_box}")
-            if calib.use_calib:
-                logger.info(f"IoU: {iou_mat[i, j]:.3f}")
-            else:
-                logger.info(f"theta_diff={theta_diff_mat[i, j]:.2f}°, sim={sim_mat[i, j]:.3f}")
-
-    match_mat = iou_mat if calib.use_calib else sim_mat
-    row_ind, col_ind = linear_sum_assignment(-match_mat)
-    matched_3d = {
-        r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
-    }
-    logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
-    if iou_mat.size > 0:
-        max_iou = iou_mat.max()
-        avg_iou = iou_mat[iou_mat > 0].mean() if max_iou > 0 else 0
-        avg_iou = 0 if np.isnan(avg_iou) else avg_iou
-        logger.info(f"IoU 矩阵最大值: {max_iou:.3f}，平均值: {avg_iou:.3f}")
-    else:
-        logger.info(f"IoU 矩阵为空")
+    mode_tag = "标定投影" if calib.use_calib else "theta 粗估"
+    proj_bboxes = [
+        (calib.box3d_to_bbox2d(d["center"], d["dimensions"], d["heading"]) if calib.use_calib else theta_to_proj_bbox(d))
+        if d.get("camera_visible", True) else None
+        for d in det3d
+    ]
 
     fused = []
     for i, d3 in enumerate(det3d):
-        if i in matched_3d:
-            d2          = det2d[matched_3d[i]]
-            yolo_conf   = d2["score"]
-            match_quality = iou_mat[i, matched_3d[i]] if calib.use_calib else sim_mat[i, matched_3d[i]]
-            # 激光雷达主导：高置信度 PVRCNN 不会被 YOLO 明显拉低
-            fused_score = d3["score"] * w_pvrcnn + (yolo_conf * match_quality) * w_yolo
-            matched     = True
-        else:
-            yolo_conf   = 0.0
-            fused_score = d3["score"] * w_pvrcnn
-            match_quality = 0.0
-            matched     = False
+        best_j = -1
+        best_quality = 0.0
+        best_yolo_conf = 0.0
+        best_camera_label = ""
+
+        if allow_cross_sensor_match and d3.get("camera_visible", True):
+            theta_lidar = lidar_center_to_theta(d3["center"])
+            for j, d2 in enumerate(det2d):
+                if d2["label"] != d3["label"]:
+                    continue
+                theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
+                if theta_diff > THETA_MATCH_DEG:
+                    continue
+                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
+                quality = theta_sim
+                if calib.use_calib and proj_bboxes[i] is not None:
+                    quality = max(quality, compute_iou_2d(proj_bboxes[i], d2["bbox"]))
+
+                cls_thresh = CAR_THETA_SIM_THRESH if d3["label"] == "car" else STRICT_THETA_SIM_THRESH
+                if quality >= cls_thresh and quality > best_quality:
+                    best_quality = quality
+                    best_j = j
+                    best_yolo_conf = d2["score"]
+                    best_camera_label = d2["label"]
+
+        matched = best_j >= 0
+        # 最终输出分数完全以 PVRCNN 为准；YOLO 仅做辅助匹配信息，不参与降权/提权
+        fused_score = d3["score"]
+
+        # 分类别最小置信度过滤：降低整体误检
+        min_keep = PVRCNN_KEEP_THRESH.get(d3["label"], PVRCNN_MIN_KEEP_SCORE)
+        if d3.get("camera_visible", True) and (not matched):
+            min_keep += PVRCNN_VISIBLE_UNMATCHED_PENALTY
+        if d3["score"] < min_keep:
+            continue
+        # 对关键类别仅抑制“低分且未被YOLO确认”的可见目标，减少误检同时避免过度丢检
+        low_conf_drop = LOW_CONF_UNMATCHED_DROP_THRESH.get(d3["label"])
+        if (
+            low_conf_drop is not None
+            and d3.get("camera_visible", True)
+            and (not matched)
+            and d3["score"] < low_conf_drop
+        ):
+            continue
+
+        # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
+        if ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
+            if d3["score"] < BUS_MIN_KEEP_SCORE:
+                continue
+            if (
+                (not matched)
+                or best_quality < BUS_MIN_MATCH_QUALITY
+                or best_yolo_conf < BUS_MIN_YOLO_CONF
+                or best_camera_label != "bus"
+            ):
+                continue
 
         if fused_score < fused_thresh:
             continue
 
         fused.append({
-            "label"      : (det2d[matched_3d[i]]["label"] if matched else d3["label"]),
-            "score"      : round(d3["score"],  4),
-            "fused_score": round(fused_score,  4),
-            "center"     : d3["center"],
-            "dimensions" : d3["dimensions"],
-            "heading"    : d3["heading"],
-            "proj_bbox"  : proj_bboxes[i],
-            "matched_2d" : matched,
-            "yolo_conf"  : round(yolo_conf, 4),
-            "match_quality": round(match_quality, 4),
+            "label": d3["label"],
+            "camera_label": best_camera_label,
+            "score": round(d3["score"], 4),
+            "fused_score": round(fused_score, 4),
+            "center": d3["center"],
+            "dimensions": d3["dimensions"],
+            "heading": d3["heading"],
+            "proj_bbox": (det2d[best_j]["bbox"] if matched else proj_bboxes[i]),
+            "matched_2d": matched,
+            "yolo_assisted": matched,  # 明确仅辅助，不产生独立输出
+            "yolo_conf": round(best_yolo_conf if matched else 0.0, 4),
+            "match_quality": round(best_quality if matched else 0.0, 4),
             "fusion_mode": mode_tag,
-            "timestamp"  : d3["timestamp"],
-            "source"     : "pvrcnn" if not matched else "pvrcnn+yolo",
+            "timestamp": d3["timestamp"],
+            "source": "pvrcnn",
             "camera_visible": d3.get("camera_visible", True),
-        })
-
-    # 仅在显式开启时添加未匹配 YOLO，并进行置信度过滤
-    matched_2d = set(matched_3d.values())
-    for j, d2 in enumerate(det2d):
-        if j in matched_2d:
-            continue
-        # include_unmatched_yolo=False 时，仍保留高置信 YOLO 估计，避免漏检
-        if (not include_unmatched_yolo) and d2["score"] < YOLO_HIGH_CONF_THRESH:
-            continue
-        if d2["score"] < unmatched_yolo_min_score:
-            continue
-        lidar_hint = find_lidar_hint_by_theta(d2, det3d)
-        if lidar_hint is not None:
-            # 有角度邻近激光雷达目标时，直接借用其3D位置，仅做标签提示
-            hint_det = lidar_hint["det3d"]
-            center = hint_det["center"]
-            dims = hint_det["dimensions"]
-            heading = hint_det["heading"]
-            source = "yolo_hint_lidar"
-        elif d2["score"] >= YOLO_HIGH_CONF_THRESH:
-            est_3d = estimate_yolo_only_3d(d2)
-            center = est_3d["center"]
-            dims = est_3d["dimensions"]
-            heading = est_3d["heading"]
-            source = "yolo_estimated"
-        else:
-            center = [0, 0, 0]
-            dims = [0, 0, 0]
-            heading = 0
-            source = "yolo_only"
-        fused.append({
-            "label"      : d2["label"],
-            "score"      : round(d2["score"], 4),
-            # YOLO 仅做提示：默认低于 PVRCNN 主结果
-            "fused_score": round(min(d2["score"] * 0.7, 0.69), 4),
-            "center"     : center,
-            "dimensions" : dims,
-            "heading"    : heading,
-            "proj_bbox"  : d2["bbox"],
-            "matched_2d" : False,
-            "yolo_conf"  : round(d2["score"], 4),
-            "match_quality": 0.0,
-            "fusion_mode": mode_tag,
-            "timestamp"  : d2["timestamp"],
-            "source"     : source,
         })
 
     fused.sort(key=lambda x: x["fused_score"], reverse=True)
@@ -1000,7 +884,12 @@ mot = MultiObjectTracker()
 def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
                   calib: KITTICalib) -> List[Dict]:
     timestamp = pvrcnn_raw[0].get("timestamp", "") if pvrcnn_raw else ""
-    fused     = fuse(pvrcnn_raw, yolo_raw, calib)
+    fused     = fuse(
+        pvrcnn_raw,
+        yolo_raw,
+        calib,
+        include_unmatched_yolo=False,
+    )
     if not fused:
         return []
     return mot.update(fused, timestamp)
