@@ -36,12 +36,14 @@ MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
 IOU_THRESH      = 0.1
+STRICT_IOU_MATCH_THRESH = 0.2      # 提高精度：跨模态匹配需更高 IoU
 W_PVRCNN        = 0.85
 W_YOLO          = 0.15
 FUSED_THRESH    = 0.1
 THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
+STRICT_THETA_SIM_THRESH = 0.5      # 提高精度：theta 模式匹配需更高相似度
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
@@ -899,7 +901,8 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
+        if (iou_mat[r, c] >= STRICT_IOU_MATCH_THRESH
+            if calib.use_calib else sim_mat[r, c] >= STRICT_THETA_SIM_THRESH)
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -929,7 +932,8 @@ def fuse(
             continue
 
         fused.append({
-            "label"      : (det2d[matched_3d[i]]["label"] if matched else d3["label"]),
+            "label"      : d3["label"],  # 最终类别以 LiDAR 为主，避免视觉误分类拉偏
+            "camera_label": (det2d[matched_3d[i]]["label"] if matched else ""),
             "score"      : round(d3["score"],  4),
             "fused_score": round(fused_score,  4),
             "center"     : d3["center"],
@@ -1130,25 +1134,28 @@ def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
     if (not timestamp) and yolo_raw:
         timestamp = yolo_raw[0].get("timestamp", "")
 
-    # 主输出以 LiDAR 3D 为主；YOLO-only 必须经过跨帧确认才输出
+    # 高精度策略：仅输出 LiDAR 检测或成功跨模态匹配结果，禁用 yolo-only 最终输出
     fused = fuse(
         pvrcnn_raw,
         yolo_raw,
         calib,
-        include_unmatched_yolo=True,
+        include_unmatched_yolo=False,
     )
     if not fused:
-        confirm_camera_only_detections([], timestamp)
         return []
 
-    lidar_primary = [d for d in fused if not str(d.get("source", "")).startswith("yolo")]
-    camera_candidates = [d for d in fused if str(d.get("source", "")).startswith("yolo")]
-    camera_confirmed = confirm_camera_only_detections(camera_candidates, timestamp)
+    strict_fused = []
+    for d in fused:
+        # 最终严格检查：若标记为跨模态匹配，则要求满足严格匹配质量
+        if d.get("matched_2d"):
+            min_quality = STRICT_IOU_MATCH_THRESH if d.get("fusion_mode") == "标定投影" else STRICT_THETA_SIM_THRESH
+            if d.get("match_quality", 0.0) < min_quality:
+                continue
+        strict_fused.append(d)
 
-    merged = lidar_primary + camera_confirmed
-    if not merged:
+    if not strict_fused:
         return []
-    return mot.update(merged, timestamp)
+    return mot.update(strict_fused, timestamp)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
