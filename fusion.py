@@ -680,11 +680,26 @@ class KalmanTracker:
         self.last_ts = timestamp
         return self.x[:2].copy()
 
+    def peek_predict(self, timestamp: str) -> np.ndarray:
+        """
+        非破坏性预测：返回给定时刻的位置预测，但不修改滤波器内部状态。
+        用于融合阶段先验，避免“先预测一次 + update里再预测一次”导致的双重外推。
+        """
+        dt = max(self._calc_dt(timestamp), 1e-3)
+        F = self._F(dt)
+        x_pred = F @ self.x
+        return x_pred[:2].copy()
+
     def update(self, x: float, y: float) -> np.ndarray:
         z      = np.array([x, y], dtype=np.float64)
-        S      = self.H @ self.P @ self.H.T + self.R
+        innovation = z - self.H @ self.x
+        # 大创新值通常对应误匹配或突发抖动，临时增大观测噪声抑制过度拉拽
+        R_eff = self.R
+        if float(np.linalg.norm(innovation)) > 4.0:
+            R_eff = self.R * 4.0
+        S      = self.H @ self.P @ self.H.T + R_eff
         K      = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ (z - self.H @ self.x)
+        self.x = self.x + K @ innovation
         self.P = (np.eye(4) - K @ self.H) @ self.P
         self.miss_count = 0
         return self.x[:2].copy()
@@ -755,7 +770,7 @@ class MultiObjectTracker:
         for trk in self.tracks:
             if label is not None and trk.label != label:
                 continue
-            pred = trk.predict(timestamp)
+            pred = trk.peek_predict(timestamp)
             vx, vy = trk.get_velocity()
             states.append({
                 "track_id": trk.track_id,
