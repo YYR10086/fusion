@@ -36,12 +36,14 @@ MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
 IOU_THRESH      = 0.1
+STRICT_IOU_MATCH_THRESH = 0.15    # 精度优先：跨模态匹配阈值更严格
 W_PVRCNN        = 0.85
 W_YOLO          = 0.15
 FUSED_THRESH    = 0.1
 THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
+STRICT_THETA_SIM_THRESH = 0.42    # 精度优先：theta 模式匹配阈值更严格
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
@@ -680,7 +682,7 @@ def fuse(
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
-        include_unmatched_yolo: bool = True,
+        include_unmatched_yolo: bool = False,
         camera_fov_only: bool = True,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
@@ -691,14 +693,14 @@ def fuse(
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
     if camera_fov_only:
+        # 关键修复：不再因相机可见性直接删除 LiDAR 目标（尤其是 cyclist）
+        # camera_visible 仅用于“是否参与跨模态匹配”，不影响 LiDAR 主输出保留
         det3d_with_vis = []
         for d in det3d:
-            visible = lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)
-            if visible or d["score"] >= PVRCNN_HIGH_CONF_KEEP:
-                d2 = dict(d)
-                d2["camera_visible"] = visible
-                det3d_with_vis.append(d2)
-        logger.info(f"PVRCNN FOV过滤(保留高置信): {len(det3d)} -> {len(det3d_with_vis)}")
+            d2 = dict(d)
+            d2["camera_visible"] = lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)
+            det3d_with_vis.append(d2)
+        logger.info(f"PVRCNN 保留全部目标，仅标注 camera_visible: {len(det3d)} -> {len(det3d_with_vis)}")
         det3d = det3d_with_vis
     else:
         det3d = [dict(d, camera_visible=True) for d in det3d]
@@ -845,7 +847,8 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
+        if (iou_mat[r, c] >= STRICT_IOU_MATCH_THRESH
+            if calib.use_calib else sim_mat[r, c] >= STRICT_THETA_SIM_THRESH)
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -875,7 +878,8 @@ def fuse(
             continue
 
         fused.append({
-            "label"      : (det2d[matched_3d[i]]["label"] if matched else d3["label"]),
+            "label"      : d3["label"],  # 最终类别以 LiDAR 为主，减少视觉误分类
+            "camera_label": (det2d[matched_3d[i]]["label"] if matched else ""),
             "score"      : round(d3["score"],  4),
             "fused_score": round(fused_score,  4),
             "center"     : d3["center"],
@@ -1000,7 +1004,12 @@ mot = MultiObjectTracker()
 def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
                   calib: KITTICalib) -> List[Dict]:
     timestamp = pvrcnn_raw[0].get("timestamp", "") if pvrcnn_raw else ""
-    fused     = fuse(pvrcnn_raw, yolo_raw, calib)
+    fused     = fuse(
+        pvrcnn_raw,
+        yolo_raw,
+        calib,
+        include_unmatched_yolo=False,
+    )
     if not fused:
         return []
     return mot.update(fused, timestamp)
