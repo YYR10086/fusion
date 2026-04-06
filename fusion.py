@@ -756,14 +756,10 @@ def fuse(
                     best_camera_label = d2["label"]
 
         matched = best_j >= 0
+        # 最终输出分数完全以 PVRCNN 为准；YOLO 仅做辅助匹配信息，不参与降权/提权
+        fused_score = d3["score"]
         if matched:
             used_yolo.add(best_j)
-            # 关键修复：融合分数不能低于 PVRCNN 原始分数，避免“融合后比 PVRCNN 更差”
-            fusion_score = d3["score"] * w_pvrcnn + (best_yolo_conf * best_quality) * w_yolo
-            fused_score = max(d3["score"], fusion_score)
-        else:
-            # 无匹配时完全沿用 PVRCNN 分数
-            fused_score = d3["score"]
 
         # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
         if ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
