@@ -36,15 +36,26 @@ MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
 IOU_THRESH      = 0.1
+STRICT_IOU_MATCH_THRESH = 0.2      # 提高精度：跨模态匹配需更高 IoU
 W_PVRCNN        = 0.85
 W_YOLO          = 0.15
 FUSED_THRESH    = 0.1
 THETA_MATCH_DEG = 10.0
 THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
+STRICT_THETA_SIM_THRESH = 0.5      # 提高精度：theta 模式匹配需更高相似度
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
+DEFAULT_INCLUDE_UNMATCHED_YOLO = False
+CAMERA_ONLY_CLASS_CFG: Dict[str, Dict[str, float]] = {
+    "car": {"min_score": 0.68, "min_streak": 2},        # 车辆宽松
+    "truck": {"min_score": 0.78, "min_streak": 2},
+    "bus": {"min_score": 0.82, "min_streak": 2},
+    "pedestrian": {"min_score": 0.90, "min_streak": 3}, # 行人严格
+    "cyclist": {"min_score": 0.90, "min_streak": 3},    # 骑行者严格
+}
+CAMERA_ONLY_MAX_THETA_GAP_DEG = 4.0
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -337,6 +348,17 @@ def angle_diff_deg(a: float, b: float) -> float:
     d = abs(a - b) % 360.0
     return float(min(d, 360.0 - d))
 
+def wrap_angle_deg(a: float) -> float:
+    """角度归一化到 [-180, 180)。"""
+    return float((a + 180.0) % 360.0 - 180.0)
+
+def yolo_theta_to_fusion(theta_deg: float) -> float:
+    """
+    将 YOLO/theta（相机平面）角度转换到融合坐标系角度。
+    当前标定关系：相机结果相对融合坐标逆时针旋转 90°。
+    """
+    return wrap_angle_deg(float(theta_deg) + 90.0)
+
 
 def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
                        img_height: int = IMAGE_HEIGHT,
@@ -376,7 +398,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -397,12 +419,18 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -414,7 +442,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -435,12 +463,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -452,7 +487,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -473,12 +508,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -490,7 +532,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -511,12 +553,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
@@ -528,7 +577,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -549,12 +598,19 @@ def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
     est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
     theta_deg = yolo_det.get("theta", 0.0)
     theta_rad = np.radians(theta_deg)
-    x = est_range * np.cos(theta_rad)
-    y = est_range * np.sin(theta_rad)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
     return {
         "center": [round(float(x), 3), round(float(y), 3), 0.0],
         "dimensions": dims,
-        "heading": float(theta_rad),
+        "heading": heading_fuse,
     }
 
 # ============================================================
@@ -680,7 +736,7 @@ def fuse(
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
-        include_unmatched_yolo: bool = True,
+        include_unmatched_yolo: bool = DEFAULT_INCLUDE_UNMATCHED_YOLO,
         camera_fov_only: bool = True,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
@@ -817,7 +873,7 @@ def fuse(
                 # theta 降级模式：优先使用角度一致性做匹配，避免“都融合进去”
                 ref_box = proj_bboxes[i]
                 theta_lidar = lidar_center_to_theta(d3["center"])
-                theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
+                theta_diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(d2.get("theta", 0.0)))
                 theta_diff_mat[i, j] = theta_diff
                 if theta_diff > THETA_MATCH_DEG:
                     continue
@@ -845,7 +901,8 @@ def fuse(
     row_ind, col_ind = linear_sum_assignment(-match_mat)
     matched_3d = {
         r: c for r, c in zip(row_ind, col_ind)
-        if (iou_mat[r, c] >= IOU_THRESH if calib.use_calib else sim_mat[r, c] >= MIN_THETA_SIM)
+        if (iou_mat[r, c] >= STRICT_IOU_MATCH_THRESH
+            if calib.use_calib else sim_mat[r, c] >= STRICT_THETA_SIM_THRESH)
     }
     logger.info(f"匹配详情: 激光雷达 {n3} 个，YOLO {n2} 个，成功匹配 {len(matched_3d)} 对")
     if iou_mat.size > 0:
@@ -875,7 +932,8 @@ def fuse(
             continue
 
         fused.append({
-            "label"      : (det2d[matched_3d[i]]["label"] if matched else d3["label"]),
+            "label"      : d3["label"],  # 最终类别以 LiDAR 为主，避免视觉误分类拉偏
+            "camera_label": (det2d[matched_3d[i]]["label"] if matched else ""),
             "score"      : round(d3["score"],  4),
             "fused_score": round(fused_score,  4),
             "center"     : d3["center"],
@@ -996,14 +1054,108 @@ def visualize_bev(
 # PART 9  主函数
 # ============================================================
 mot = MultiObjectTracker()
+camera_only_memory: List[Dict] = []
+
+def _candidate_theta(det: Dict) -> float:
+    center = det.get("center", [0, 0, 0])
+    if isinstance(center, list) and len(center) >= 2 and (abs(center[0]) + abs(center[1]) > 1e-3):
+        return lidar_center_to_theta(center, clip_to_fov=False)
+    bbox = det.get("proj_bbox")
+    if bbox:
+        x_center = (bbox[0] + bbox[2]) / 2.0
+        return float((x_center / IMAGE_WIDTH - 0.5) * CAMERA_FOV_DEG)
+    return 0.0
+
+def confirm_camera_only_detections(candidates: List[Dict], timestamp: str) -> List[Dict]:
+    """
+    Camera-only 目标确认：
+    - 单帧不输出；
+    - 连续多帧命中后输出；
+    - 车辆阈值宽松，行人/骑行者阈值严格。
+    """
+    global camera_only_memory
+    for m in camera_only_memory:
+        m["updated"] = False
+
+    for d in candidates:
+        label = d["label"]
+        cfg = CAMERA_ONLY_CLASS_CFG.get(label, {"min_score": YOLO_HIGH_CONF_THRESH, "min_streak": 2})
+        if d.get("score", 0.0) < cfg["min_score"]:
+            continue
+        if d.get("center", [0, 0, 0]) == [0, 0, 0]:
+            continue
+
+        theta = _candidate_theta(d)
+        best_idx = -1
+        best_gap = float("inf")
+        for idx, mem in enumerate(camera_only_memory):
+            if mem["label"] != label:
+                continue
+            gap = angle_diff_deg(theta, mem["theta"])
+            if gap <= CAMERA_ONLY_MAX_THETA_GAP_DEG and gap < best_gap:
+                best_gap = gap
+                best_idx = idx
+
+        if best_idx >= 0:
+            mem = camera_only_memory[best_idx]
+            mem["theta"] = theta
+            mem["streak"] += 1
+            mem["updated"] = True
+            mem["det"] = dict(d)
+            mem["last_ts"] = timestamp
+        else:
+            camera_only_memory.append({
+                "label": label,
+                "theta": theta,
+                "streak": 1,
+                "updated": True,
+                "det": dict(d),
+                "last_ts": timestamp,
+            })
+
+    confirmed: List[Dict] = []
+    kept: List[Dict] = []
+    for mem in camera_only_memory:
+        if not mem["updated"]:
+            continue
+        cfg = CAMERA_ONLY_CLASS_CFG.get(mem["label"], {"min_score": YOLO_HIGH_CONF_THRESH, "min_streak": 2})
+        if mem["streak"] >= cfg["min_streak"]:
+            out = dict(mem["det"])
+            out["source"] = "camera_confirmed"
+            out["fusion_mode"] = "camera_confirmed"
+            confirmed.append(out)
+        kept.append(mem)
+    camera_only_memory = kept
+    return confirmed
 
 def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
                   calib: KITTICalib) -> List[Dict]:
     timestamp = pvrcnn_raw[0].get("timestamp", "") if pvrcnn_raw else ""
-    fused     = fuse(pvrcnn_raw, yolo_raw, calib)
+    if (not timestamp) and yolo_raw:
+        timestamp = yolo_raw[0].get("timestamp", "")
+
+    # 高精度策略：仅输出 LiDAR 检测或成功跨模态匹配结果，禁用 yolo-only 最终输出
+    fused = fuse(
+        pvrcnn_raw,
+        yolo_raw,
+        calib,
+        include_unmatched_yolo=False,
+    )
     if not fused:
         return []
-    return mot.update(fused, timestamp)
+
+    strict_fused = []
+    for d in fused:
+        # 最终严格检查：若标记为跨模态匹配，则要求满足严格匹配质量
+        if d.get("matched_2d"):
+            min_quality = STRICT_IOU_MATCH_THRESH if d.get("fusion_mode") == "标定投影" else STRICT_THETA_SIM_THRESH
+            if d.get("match_quality", 0.0) < min_quality:
+                continue
+        strict_fused.append(d)
+
+    if not strict_fused:
+        return []
+    return mot.update(strict_fused, timestamp)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
