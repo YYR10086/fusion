@@ -346,6 +346,17 @@ def angle_diff_deg(a: float, b: float) -> float:
     d = abs(a - b) % 360.0
     return float(min(d, 360.0 - d))
 
+def wrap_angle_deg(a: float) -> float:
+    """角度归一化到 [-180, 180)。"""
+    return float((a + 180.0) % 360.0 - 180.0)
+
+def yolo_theta_to_fusion(theta_deg: float) -> float:
+    """
+    将 YOLO/theta（相机平面）角度转换到融合坐标系角度。
+    当前标定关系：相机结果相对融合坐标逆时针旋转 90°。
+    """
+    return wrap_angle_deg(float(theta_deg) + 90.0)
+
 
 def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
                        img_height: int = IMAGE_HEIGHT,
@@ -385,7 +396,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -429,52 +440,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
-        if diff < best_diff:
-            best_diff = diff
-            best = d3
-    if best is None or best_diff > max_theta_diff:
-        return None
-    return {"det3d": best, "theta_diff": best_diff}
-
-def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
-    """
-    当 YOLO 置信度很高且当前无匹配激光雷达时，估计一个保守 3D 目标，
-    仅作为提示，不覆盖激光雷达结果。
-    """
-    label = yolo_det["label"]
-    dims = CLASS_SIZE_PRIOR.get(label, [4.0, 1.8, 1.6])
-    bbox = yolo_det["bbox"]
-    pix_h = max(bbox[3] - bbox[1], 1.0)
-    # 经验距离估计：高像素高度 -> 近；低像素高度 -> 远
-    est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
-    theta_deg = yolo_det.get("theta", 0.0)
-    theta_rad = np.radians(theta_deg)
-
-    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
-    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
-    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
-    x_cam = est_range * np.cos(theta_rad)
-    y_cam = est_range * np.sin(theta_rad)
-    x = -y_cam
-    y = x_cam
-    heading_fuse = float(theta_rad + np.pi / 2.0)
-    return {
-        "center": [round(float(x), 3), round(float(y), 3), 0.0],
-        "dimensions": dims,
-        "heading": heading_fuse,
-    }
-
-def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
-                             max_theta_diff: float = THETA_MATCH_DEG) -> Optional[Dict]:
-    """基于 YOLO 角度在激光雷达结果中查找最近目标，作为提示信息。"""
-    best = None
-    best_diff = float("inf")
-    for d3 in det3d:
-        if d3["label"] != yolo_det["label"]:
-            continue
-        theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -519,7 +485,7 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -564,7 +530,52 @@ def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
         if d3["label"] != yolo_det["label"]:
             continue
         theta_lidar = lidar_center_to_theta(d3["center"])
-        diff = angle_diff_deg(theta_lidar, yolo_det.get("theta", 0.0))
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
+        if diff < best_diff:
+            best_diff = diff
+            best = d3
+    if best is None or best_diff > max_theta_diff:
+        return None
+    return {"det3d": best, "theta_diff": best_diff}
+
+def estimate_yolo_only_3d(yolo_det: Dict) -> Dict:
+    """
+    当 YOLO 置信度很高且当前无匹配激光雷达时，估计一个保守 3D 目标，
+    仅作为提示，不覆盖激光雷达结果。
+    """
+    label = yolo_det["label"]
+    dims = CLASS_SIZE_PRIOR.get(label, [4.0, 1.8, 1.6])
+    bbox = yolo_det["bbox"]
+    pix_h = max(bbox[3] - bbox[1], 1.0)
+    # 经验距离估计：高像素高度 -> 近；低像素高度 -> 远
+    est_range = float(np.clip(800.0 / pix_h, 6.0, CAMERA_MAX_RANGE_M))
+    theta_deg = yolo_det.get("theta", 0.0)
+    theta_rad = np.radians(theta_deg)
+
+    # 相机角度坐标与当前融合坐标系存在 90° 逆时针旋转差
+    # 原始相机平面坐标: (x_cam, y_cam) = (r*cosθ, r*sinθ)
+    # 旋转后映射到融合坐标: (x_fuse, y_fuse) = (-y_cam, x_cam)
+    x_cam = est_range * np.cos(theta_rad)
+    y_cam = est_range * np.sin(theta_rad)
+    x = -y_cam
+    y = x_cam
+    heading_fuse = float(theta_rad + np.pi / 2.0)
+    return {
+        "center": [round(float(x), 3), round(float(y), 3), 0.0],
+        "dimensions": dims,
+        "heading": heading_fuse,
+    }
+
+def find_lidar_hint_by_theta(yolo_det: Dict, det3d: List[Dict],
+                             max_theta_diff: float = THETA_MATCH_DEG) -> Optional[Dict]:
+    """基于 YOLO 角度在激光雷达结果中查找最近目标，作为提示信息。"""
+    best = None
+    best_diff = float("inf")
+    for d3 in det3d:
+        if d3["label"] != yolo_det["label"]:
+            continue
+        theta_lidar = lidar_center_to_theta(d3["center"])
+        diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(yolo_det.get("theta", 0.0)))
         if diff < best_diff:
             best_diff = diff
             best = d3
@@ -860,7 +871,7 @@ def fuse(
                 # theta 降级模式：优先使用角度一致性做匹配，避免“都融合进去”
                 ref_box = proj_bboxes[i]
                 theta_lidar = lidar_center_to_theta(d3["center"])
-                theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
+                theta_diff = angle_diff_deg(theta_lidar, yolo_theta_to_fusion(d2.get("theta", 0.0)))
                 theta_diff_mat[i, j] = theta_diff
                 if theta_diff > THETA_MATCH_DEG:
                     continue
