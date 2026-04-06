@@ -53,6 +53,9 @@ PVRCNN_MIN_KEEP_SCORE = 0.22      # LiDAR-only 最低保留分数，抑制低分
 CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
 CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
 CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
+ENABLE_BUS_SUPPRESSION = True
+BUS_MIN_KEEP_SCORE = 0.60         # bus 误检较多时提高准入门槛
+BUS_MIN_MATCH_QUALITY = 0.55      # 需要较高跨模态质量才保留 bus
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
@@ -757,6 +760,13 @@ def fuse(
             fused_score = d3["score"] * w_pvrcnn + (best_yolo_conf * best_quality) * w_yolo
         else:
             fused_score = d3["score"] * w_pvrcnn
+
+        # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
+        if ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
+            if d3["score"] < BUS_MIN_KEEP_SCORE:
+                continue
+            if (not matched) or best_quality < BUS_MIN_MATCH_QUALITY or best_camera_label != "bus":
+                continue
 
         if fused_score < fused_thresh:
             continue
