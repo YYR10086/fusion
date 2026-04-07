@@ -806,7 +806,7 @@ def fuse(
         camera_fov_only: bool = False,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
 ) -> List[Dict]:
-    del include_unmatched_yolo, unmatched_yolo_min_score, w_pvrcnn, w_yolo, camera_fov_only
+    del w_pvrcnn, w_yolo, camera_fov_only
 
     det3d = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
     det2d = [yolo_to_unified(d) for d in yolo_raw]
@@ -835,6 +835,7 @@ def fuse(
     ]
 
     fused = []
+    matched_yolo_idx = set()
     for i, d3 in enumerate(det3d):
         best_j = -1
         best_quality = 0.0
@@ -870,6 +871,8 @@ def fuse(
                     best_camera_label = d2["label"]
 
         matched = best_j >= 0
+        if matched:
+            matched_yolo_idx.add(best_j)
         # 最终输出分数完全以 PVRCNN 为准；YOLO 仅做辅助匹配信息，不参与降权/提权
         fused_score = d3["score"]
 
@@ -928,6 +931,68 @@ def fuse(
             "source": "pvrcnn",
             "camera_visible": d3.get("camera_visible", True),
         })
+
+    if include_unmatched_yolo and motion_predictions:
+        # 仅在“有轨迹预测”时，利用高分 YOLO 未匹配目标做短时补检
+        # 目的：提升 PVRCNN 短时漏检场景下的 TP 上限
+        used_pred_track_ids = set()
+        for j, d2 in enumerate(det2d):
+            if j in matched_yolo_idx or d2["score"] < unmatched_yolo_min_score:
+                continue
+
+            best_pred = None
+            best_theta_diff = float("inf")
+            for pred in motion_predictions:
+                if pred.get("track_id") in used_pred_track_ids:
+                    continue
+                if pred.get("label") != d2["label"]:
+                    continue
+                px, py = pred.get("pred_center", [0.0, 0.0])
+                pred_theta = lidar_center_to_theta([px, py, 0.0], clip_to_fov=False)
+                theta_diff = angle_diff_deg(pred_theta, d2.get("theta", 0.0))
+                if theta_diff <= THETA_MATCH_DEG and theta_diff < best_theta_diff:
+                    best_theta_diff = theta_diff
+                    best_pred = pred
+
+            if best_pred is None:
+                continue
+
+            px, py = best_pred.get("pred_center", [0.0, 0.0])
+            # 若已有同类检测在预测点附近，则不重复恢复
+            if any(
+                fd["label"] == d2["label"] and
+                float(np.hypot(fd["center"][0] - px, fd["center"][1] - py)) <= 2.5
+                for fd in fused
+            ):
+                continue
+
+            used_pred_track_ids.add(best_pred.get("track_id"))
+            theta_sim = float(np.exp(-(best_theta_diff ** 2) / (2 * (THETA_SIGMA_DEG ** 2))))
+            rec_score = float(np.clip(0.5 * d2["score"] + 0.5 * theta_sim, 0.0, 1.0))
+            dims = CLASS_SIZE_PRIOR.get(d2["label"], [4.0, 1.8, 1.6])
+            heading = float(np.arctan2(py, max(px, 1e-6)))
+
+            fused.append({
+                "label": d2["label"],
+                "camera_label": d2["label"],
+                "score": round(rec_score, 4),
+                "fused_score": round(rec_score, 4),
+                "center": [float(px), float(py), 0.0],
+                "dimensions": dims,
+                "heading": heading,
+                "proj_bbox": d2.get("bbox"),
+                "matched_2d": True,
+                "yolo_assisted": True,
+                "yolo_conf": round(d2["score"], 4),
+                "match_quality": round(theta_sim, 4),
+                "motion_prior": round(theta_sim, 4),
+                "fusion_mode": f"{mode_tag}+track_yolo_recover",
+                "timestamp": d2.get("timestamp", ts3),
+                "source": "track_yolo_recover",
+                "camera_visible": True,
+                "recovered_by_track_yolo": True,
+                "recovery_track_id": best_pred.get("track_id"),
+            })
 
     fused.sort(key=lambda x: x["fused_score"], reverse=True)
     return fused
