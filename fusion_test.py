@@ -1,5 +1,14 @@
 import json
-from fusion import KITTICalib, MultiObjectTracker, fuse, lidar_in_camera_fov, CAMERA_FOV_DEG
+import math
+from fusion import (
+    KITTICalib,
+    MultiObjectTracker,
+    fuse,
+    lidar_in_camera_fov,
+    lidar_center_to_theta,
+    yolo_to_unified,
+    CAMERA_FOV_DEG,
+)
 
 # 路径配置
 YOLO_JSON = "./record_output/record_output5/detection_results.json"
@@ -14,6 +23,10 @@ DUAL_CONF_RECOVER_THRESH = 0.42    # 联合分数阈值
 TRACK_CONF_DECAY = 0.90            # 轨迹置信度衰减
 TRACK_CONF_BOOST_MATCHED = 0.18    # 与图像匹配时提升轨迹置信度
 TRACK_CONF_BOOST_MOTION = 0.12     # motion prior 较高时提升轨迹置信度
+ENABLE_TRACK_YOLO_RECOVERY = True  # 用历史轨迹 + YOLO 弱观测补回 PVRCNN 漏检，直接提升TP上限
+RECOVERY_MIN_TRACK_CONF = 0.55
+RECOVERY_MIN_YOLO_SCORE = 0.55
+RECOVERY_MAX_THETA_DIFF = 9.0
 
 
 def load_json(path):
@@ -66,6 +79,87 @@ def dual_confidence_filter(detections, track_conf_state):
     return filtered
 
 
+def build_track_yolo_recoveries(fused, yolo_raw, pred_states, track_conf_state, track_memory):
+    """
+    轨迹-相机联合补检：
+    - 目标：当 PVRCNN 短时漏检时，利用历史轨迹预测 + YOLO 弱观测恢复候选，提升 TP。
+    - 约束：仅对高轨迹置信度 track 启用，且要求类别一致 + theta 接近，降低误检风险。
+    """
+    if not ENABLE_TRACK_YOLO_RECOVERY:
+        return []
+    if not pred_states or not yolo_raw:
+        return []
+
+    yolo_candidates = [yolo_to_unified(d) for d in yolo_raw]
+    yolo_candidates = [d for d in yolo_candidates if d.get("label") and d.get("score", 0.0) >= RECOVERY_MIN_YOLO_SCORE]
+
+    recoveries = []
+    used_yolo = set()
+    for pred in pred_states:
+        track_id = pred.get("track_id")
+        label = pred.get("label")
+        pred_center = pred.get("pred_center", [0.0, 0.0])
+        pred_theta = lidar_center_to_theta([pred_center[0], pred_center[1], 0.0], CAMERA_FOV_DEG, clip_to_fov=False)
+        track_conf = clamp01(track_conf_state.get(track_id, 0.0))
+        if track_conf < RECOVERY_MIN_TRACK_CONF:
+            continue
+
+        already_supported = any(
+            d.get("label") == label and
+            math.hypot(d["center"][0] - pred_center[0], d["center"][1] - pred_center[1]) <= 2.5
+            for d in fused
+        )
+        if already_supported:
+            continue
+
+        best_j = -1
+        best_theta_diff = float("inf")
+        for j, y in enumerate(yolo_candidates):
+            if j in used_yolo or y["label"] != label:
+                continue
+            theta_diff = abs(y.get("theta", 0.0) - pred_theta)
+            if theta_diff <= RECOVERY_MAX_THETA_DIFF and theta_diff < best_theta_diff:
+                best_theta_diff = theta_diff
+                best_j = j
+
+        if best_j < 0:
+            continue
+        used_yolo.add(best_j)
+        y = yolo_candidates[best_j]
+
+        r = max(math.hypot(pred_center[0], pred_center[1]), 1.0)
+        theta_rad = math.radians(y.get("theta", 0.0))
+        recovered_center = [round(r * math.cos(theta_rad), 4), round(r * math.sin(theta_rad), 4), 0.0]
+
+        memory = track_memory.get(track_id, {})
+        dimensions = memory.get("dimensions", [4.0, 1.8, 1.6])
+        heading = memory.get("heading", theta_rad)
+        rec_score = clamp01(0.5 * float(y.get("score", 0.0)) + 0.5 * track_conf)
+
+        recoveries.append({
+            "label": label,
+            "camera_label": label,
+            "score": round(rec_score, 4),
+            "fused_score": round(rec_score, 4),
+            "center": recovered_center,
+            "dimensions": dimensions,
+            "heading": float(heading),
+            "proj_bbox": y.get("bbox"),
+            "matched_2d": True,
+            "yolo_assisted": True,
+            "yolo_conf": round(float(y.get("score", 0.0)), 4),
+            "match_quality": round(max(0.0, 1.0 - (best_theta_diff / max(RECOVERY_MAX_THETA_DIFF, 1e-6))), 4),
+            "motion_prior": round(track_conf, 4),
+            "fusion_mode": "track+yolo_recover",
+            "timestamp": y.get("timestamp", ""),
+            "source": "track_yolo_recover",
+            "camera_visible": True,
+            "recovered_by_track_yolo": True,
+            "recovery_track_id": track_id,
+        })
+    return recoveries
+
+
 def main():
     yolo_data = load_json(YOLO_JSON)
     pvrcnn_data = load_json(PVRCNN_JSON)
@@ -79,6 +173,7 @@ def main():
     calib = KITTICalib("calib.txt")
     mot = MultiObjectTracker()
     track_conf_state = {}
+    track_memory = {}
 
     all_results = []
     stats = {
@@ -143,12 +238,33 @@ def main():
             if (not d.get("matched_2d")) and d.get("center") == [0, 0, 0]
         )
 
-        if fused:
-            tracked = mot.update(fused, timestamp) if timestamp else fused
-            output_dets = tracked if USE_TRACKING else fused
+        pred_states = mot.predict_states(timestamp) if timestamp else []
+        recoveries = build_track_yolo_recoveries(
+            fused=fused,
+            yolo_raw=yolo_dets,
+            pred_states=pred_states,
+            track_conf_state=track_conf_state,
+            track_memory=track_memory,
+        )
+        fused_all = fused + recoveries
+
+        if fused_all:
+            tracked = mot.update(fused_all, timestamp) if timestamp else fused_all
+            output_dets = tracked if USE_TRACKING else fused_all
             output_dets = dual_confidence_filter(output_dets, track_conf_state)
             if not output_dets:
                 continue
+
+            for d in tracked:
+                tid = d.get("track_id")
+                if tid is None:
+                    continue
+                track_memory[tid] = {
+                    "label": d.get("label", ""),
+                    "dimensions": d.get("dimensions", [4.0, 1.8, 1.6]),
+                    "heading": d.get("heading", 0.0),
+                }
+
             all_results.append({
                 "frame_id": idx,
                 "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
@@ -169,6 +285,12 @@ def main():
                 "track_conf_decay": TRACK_CONF_DECAY,
                 "track_conf_boost_matched": TRACK_CONF_BOOST_MATCHED,
                 "track_conf_boost_motion": TRACK_CONF_BOOST_MOTION,
+            },
+            "track_yolo_recover_params": {
+                "enable_track_yolo_recovery": ENABLE_TRACK_YOLO_RECOVERY,
+                "recovery_min_track_conf": RECOVERY_MIN_TRACK_CONF,
+                "recovery_min_yolo_score": RECOVERY_MIN_YOLO_SCORE,
+                "recovery_max_theta_diff": RECOVERY_MAX_THETA_DIFF,
             },
             "stats": stats,
         },
