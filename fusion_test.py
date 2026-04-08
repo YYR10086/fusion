@@ -61,15 +61,18 @@ def dual_confidence_filter(detections, track_conf_state):
     for det in detections:
         track_id = det.get("track_id")
         det_conf = clamp01(det.get("fused_score", det.get("score", 0.0)))
-        prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
-        track_conf = prev_track_conf * TRACK_CONF_DECAY
+        if track_id is None:
+            track_conf = det_conf
+        else:
+            prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
+            track_conf = prev_track_conf * TRACK_CONF_DECAY
 
-        if det.get("matched_2d"):
-            track_conf += TRACK_CONF_BOOST_MATCHED
-        if det.get("motion_prior", 0.0) >= 0.35:
-            track_conf += TRACK_CONF_BOOST_MOTION
-        track_conf = clamp01(track_conf)
-        track_conf_state[track_id] = track_conf
+            if det.get("matched_2d"):
+                track_conf += TRACK_CONF_BOOST_MATCHED
+            if det.get("motion_prior", 0.0) >= 0.35:
+                track_conf += TRACK_CONF_BOOST_MOTION
+            track_conf = clamp01(track_conf)
+            track_conf_state[track_id] = track_conf
 
         combined_conf = DUAL_CONF_ALPHA * det_conf + (1.0 - DUAL_CONF_ALPHA) * track_conf
         keep = (det_conf >= DET_CONF_KEEP_THRESH) or (combined_conf >= DUAL_CONF_RECOVER_THRESH)
@@ -109,10 +112,12 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "last_heading": det.get("heading", 0.0),
             "label": det.get("label", ""),
         })
-        if det.get("matched_2d"):
+        # 只要本帧被观测到（尤其是 cyclist/pedestrian 的 PVRCNN 观测），就应提升轨迹强度，
+        # 否则会出现“从未进入可预测状态”的问题。
+        if det.get("matched_2d") or det.get("source") == "pvrcnn":
             st["strength"] = 1.0
         else:
-            st["strength"] = max(st.get("strength", 0.5), 0.5)
+            st["strength"] = max(st.get("strength", 0.5), 0.7)
         st["last_dimensions"] = det.get("dimensions", st["last_dimensions"])
         st["last_heading"] = det.get("heading", st["last_heading"])
         st["label"] = det.get("label", st.get("label", ""))
@@ -136,7 +141,8 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             continue
 
         prev_strength = float(st.get("strength", 0.5))
-        new_strength = 0.5 if prev_strength >= 1.0 else 0.0
+        # 放宽缺失衰减门限：>=0.7 也允许进入一次预测恢复
+        new_strength = 0.5 if prev_strength >= 0.7 else 0.0
         if new_strength <= 0.0:
             track_state.pop(tid, None)
             continue
@@ -148,6 +154,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         else:
             heading = float(st.get("last_heading", 0.0))
 
+        # 当前位置使用“当前帧预测状态 + 一小步速度前推”，用于显式位置预测
         px = float(trk.x[0] + vx * dt_s)
         py = float(trk.x[1] + vy * dt_s)
         rec = {
