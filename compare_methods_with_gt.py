@@ -361,6 +361,38 @@ def yolo_theta_field_name(pred):
     return None
 
 
+def extract_yolo_label(pred):
+    for field in ("label", "class_label", "class_name", "name"):
+        v = pred.get(field)
+        if v is not None:
+            return str(v)
+    return "Unknown"
+
+
+def extract_yolo_theta_candidates_deg(pred):
+    """
+    返回候选角度（单位：度）。
+    - 明确 *_deg 字段：按度处理
+    - 明确 *_rad 字段：按弧度转度
+    - 模糊字段（theta/angle/alpha）：同时尝试“原值即度”和“弧度转度”
+      以避免小角度度值被误判成弧度导致匹配失败。
+    """
+    for field in ("theta_deg", "angle_deg", "alpha_deg"):
+        if field in pred:
+            return [float(pred[field])]
+
+    for field in ("theta_rad", "angle_rad", "alpha_rad"):
+        if field in pred:
+            return [math.degrees(float(pred[field]))]
+
+    for field in ("theta", "angle", "alpha"):
+        if field in pred:
+            raw = float(pred[field])
+            return [raw, math.degrees(raw)]
+
+    return []
+
+
 # ============================================================
 # 7. 评估 3D 方法：PVRCNN / Fusion
 # ============================================================
