@@ -112,10 +112,12 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "last_heading": det.get("heading", 0.0),
             "label": det.get("label", ""),
         })
-        if det.get("matched_2d"):
+        # 只要本帧被观测到（尤其是 cyclist/pedestrian 的 PVRCNN 观测），就应提升轨迹强度，
+        # 否则会出现“从未进入可预测状态”的问题。
+        if det.get("matched_2d") or det.get("source") == "pvrcnn":
             st["strength"] = 1.0
         else:
-            st["strength"] = max(st.get("strength", 0.5), 0.5)
+            st["strength"] = max(st.get("strength", 0.5), 0.7)
         st["last_dimensions"] = det.get("dimensions", st["last_dimensions"])
         st["last_heading"] = det.get("heading", st["last_heading"])
         st["label"] = det.get("label", st.get("label", ""))
@@ -139,7 +141,8 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             continue
 
         prev_strength = float(st.get("strength", 0.5))
-        new_strength = 0.5 if prev_strength >= 1.0 else 0.0
+        # 放宽缺失衰减门限：>=0.7 也允许进入一次预测恢复
+        new_strength = 0.5 if prev_strength >= 0.7 else 0.0
         if new_strength <= 0.0:
             track_state.pop(tid, None)
             continue
@@ -151,9 +154,9 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         else:
             heading = float(st.get("last_heading", 0.0))
 
-        # trk.x 已是当前帧时刻状态，避免再次外推导致补框与实测错位
-        px = float(trk.x[0])
-        py = float(trk.x[1])
+        # 当前位置使用“当前帧预测状态 + 一小步速度前推”，用于显式位置预测
+        px = float(trk.x[0] + vx * dt_s)
+        py = float(trk.x[1] + vy * dt_s)
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
