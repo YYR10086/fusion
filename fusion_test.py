@@ -2,7 +2,6 @@ import json
 import math
 from datetime import datetime
 from fusion import (
-    KITTICalib,
     MultiObjectTracker,
     fuse,
     lidar_in_camera_fov,
@@ -244,7 +243,6 @@ def main():
     if len(yolo_frames) != len(pvrcnn_frames):
         print(f"[WARNING] 帧数不匹配: YOLO={len(yolo_frames)}, PV-RCNN={len(pvrcnn_frames)}")
 
-    calib = KITTICalib("calib.txt")
     mot = MultiObjectTracker()
     track_conf_state = {}
     track_strength_state = {}
@@ -294,7 +292,6 @@ def main():
         fused = fuse(
             pvrcnn_dets,
             yolo_dets,
-            calib,
             motion_predictions=(
                 mot.predict_states(timestamp) if (USE_MOTION_PRIOR and timestamp) else None
             ),
@@ -338,7 +335,7 @@ def main():
     output = {
         "meta": {
             "total_frames": len(all_results),
-            "fusion_mode": "calib" if calib.use_calib else "theta",
+            "fusion_mode": "theta",
             "use_tracking": USE_TRACKING,
             "use_motion_prior": USE_MOTION_PRIOR,
             "enable_dual_conf_recovery": ENABLE_DUAL_CONF_RECOVERY,
