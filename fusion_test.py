@@ -144,6 +144,10 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         st = track_state.get(tid)
         if st is None:
             continue
+        # 最多只对首个丢失帧做恢复，防止长期残留框
+        if trk.miss_count > 1:
+            track_state.pop(tid, None)
+            continue
 
         prev_strength = float(st.get("strength", 0.5))
         # 放宽缺失衰减门限：>=0.7 也允许进入一次预测恢复
@@ -162,7 +166,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         # 当前位置使用“当前帧预测状态 + 一小步速度前推”，并限制最大步长抑制跳变
         px = float(trk.x[0] + vx * dt_s)
         py = float(trk.x[1] + vy * dt_s)
-        lx, ly, _ = st.get("last_center", [px, py, 0.0])
+        lx, ly, lz = st.get("last_center", [px, py, 0.0])
         step = math.hypot(px - lx, py - ly)
         if step > MAX_RECOVERY_STEP_M:
             scale = MAX_RECOVERY_STEP_M / max(step, 1e-6)
@@ -173,7 +177,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "camera_label": "",
             "score": round(0.3 * new_strength, 4),
             "fused_score": round(0.3 * new_strength, 4),
-            "center": [px, py, 0.0],
+            "center": [px, py, float(lz)],
             "dimensions": st.get("last_dimensions", [4.0, 1.8, 1.6]),
             "heading": heading,
             "proj_bbox": None,
@@ -191,7 +195,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         }
         st["strength"] = new_strength
         st["last_heading"] = heading
-        st["last_center"] = [px, py, 0.0]
+        st["last_center"] = [px, py, float(lz)]
         track_state[tid] = st
         out.append(rec)
 

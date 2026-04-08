@@ -792,8 +792,12 @@ class MultiObjectTracker:
             dist_mat = np.linalg.norm(pred_pos[:, None] - det_pos[None, :], axis=2)
             row_ind, col_ind = linear_sum_assignment(dist_mat)
             for r, c in zip(row_ind, col_ind):
-                if (dist_mat[r, c] <= self.match_dist and
-                        self.tracks[r].label == focus_dets[c]["label"]):
+                trk = self.tracks[r]
+                speed = float(np.hypot(*trk.get_velocity()))
+                # 动态门限：目标越快允许位移略大，但整体不超过全局门限，抑制误关联导致的“幽灵框”
+                dyn_match_dist = min(self.match_dist, 1.2 + 0.5 * speed)
+                if (dist_mat[r, c] <= dyn_match_dist and
+                        trk.label == focus_dets[c]["label"]):
                     pairs[r] = c; matched_t.add(r); matched_d.add(c)
 
         smoothed = []
