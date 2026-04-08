@@ -659,6 +659,9 @@ class KalmanTracker:
         self.label      = label
         self.miss_count = 0
         self.last_ts    = timestamp
+        self.prev_meas = np.array([x, y], dtype=np.float64)
+        self.prev_meas_ts = timestamp
+        self.vel_ema = np.array([0.0, 0.0], dtype=np.float64)
         self.x = np.array([x, y, 0.0, 0.0], dtype=np.float64)
         self.P = np.diag([10.0, 10.0, 100.0, 100.0])
         self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float64)
@@ -692,7 +695,7 @@ class KalmanTracker:
         x_pred = F @ self.x
         return x_pred[:2].copy()
 
-    def update(self, x: float, y: float) -> np.ndarray:
+    def update(self, x: float, y: float, timestamp: Optional[str] = None) -> np.ndarray:
         z      = np.array([x, y], dtype=np.float64)
         innovation = z - self.H @ self.x
         # 大创新值通常对应误匹配或突发抖动，临时增大观测噪声抑制过度拉拽
@@ -703,6 +706,24 @@ class KalmanTracker:
         K      = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ innovation
         self.P = (np.eye(4) - K @ self.H) @ self.P
+
+        # 基于相邻观测点计算速度，并与卡尔曼速度融合，降低速度抖动
+        t_cur = parse_timestamp(timestamp) if timestamp else None
+        t_prev = parse_timestamp(self.prev_meas_ts) if self.prev_meas_ts else None
+        dt_meas = (t_cur - t_prev).total_seconds() if (t_cur and t_prev) else 0.0
+        if dt_meas > 1e-3:
+            meas_v = (z - self.prev_meas) / dt_meas
+            kf_v = self.x[2:].copy()
+            blend_v = 0.6 * meas_v + 0.4 * kf_v
+            speed = float(np.linalg.norm(blend_v))
+            if speed > 45.0:
+                blend_v *= (45.0 / speed)
+            self.vel_ema = 0.7 * self.vel_ema + 0.3 * blend_v
+            self.x[2:] = self.vel_ema
+
+        self.prev_meas = z.copy()
+        if timestamp:
+            self.prev_meas_ts = timestamp
         self.miss_count = 0
         return self.x[:2].copy()
 
@@ -751,9 +772,10 @@ class MultiObjectTracker:
         for t_idx, d_idx in pairs.items():
             d      = detections[d_idx]
             trk    = self.tracks[t_idx]
-            sx, sy = trk.update(d["center"][0], d["center"][1])
+            trk.update(d["center"][0], d["center"][1], timestamp)
             out    = dict(d)
-            out["center"] = [sx, sy, d["center"][2]]
+            # 若预测与实测为同一目标，保留原始检测框/中心，仅附加速度估计
+            out["center"] = [float(d["center"][0]), float(d["center"][1]), float(d["center"][2])]
             smoothed.append(self._attach(out, trk, list(trk.get_velocity())))
 
         for i in range(len(self.tracks)):
