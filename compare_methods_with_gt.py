@@ -43,6 +43,10 @@ CAMERA_FOV_DEG = 150.0
 # 是否允许类别组匹配
 ALLOW_GROUP_MATCH = False
 
+# YOLO 调试开关（定位 car / cyclist 为什么为 0）
+DEBUG_YOLO = True
+DEBUG_MAX_FRAMES = 8
+
 
 # ============================================================
 # 2. 类别映射
@@ -350,6 +354,45 @@ def extract_yolo_theta_candidates_deg(pred):
     return []
 
 
+def yolo_theta_field_name(pred):
+    for field in ("theta_deg", "angle_deg", "alpha_deg", "theta_rad", "angle_rad", "alpha_rad", "theta", "angle", "alpha"):
+        if field in pred:
+            return field
+    return None
+
+
+def extract_yolo_label(pred):
+    for field in ("label", "class_label", "class_name", "name"):
+        v = pred.get(field)
+        if v is not None:
+            return str(v)
+    return "Unknown"
+
+
+def extract_yolo_theta_candidates_deg(pred):
+    """
+    返回候选角度（单位：度）。
+    - 明确 *_deg 字段：按度处理
+    - 明确 *_rad 字段：按弧度转度
+    - 模糊字段（theta/angle/alpha）：同时尝试“原值即度”和“弧度转度”
+      以避免小角度度值被误判成弧度导致匹配失败。
+    """
+    for field in ("theta_deg", "angle_deg", "alpha_deg"):
+        if field in pred:
+            return [float(pred[field])]
+
+    for field in ("theta_rad", "angle_rad", "alpha_rad"):
+        if field in pred:
+            return [math.degrees(float(pred[field]))]
+
+    for field in ("theta", "angle", "alpha"):
+        if field in pred:
+            raw = float(pred[field])
+            return [raw, math.degrees(raw)]
+
+    return []
+
+
 # ============================================================
 # 7. 评估 3D 方法：PVRCNN / Fusion
 # ============================================================
@@ -424,8 +467,21 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
 
     common_keys = sorted(set(gt_map.keys()) & set(yolo_map.keys()))
     print(f"[YOLO Eval] Common frames: {len(common_keys)}")
+    if DEBUG_YOLO:
+        print(f"[YOLO Debug] Target classes: {target_classes}")
+        if len(common_keys) == 0:
+            print("[YOLO Debug] common_keys=0，请优先检查 GT/YOLO 的 frame key 是否对齐。")
 
-    for key in common_keys:
+    debug_global = {
+        "raw_labels": {},
+        "norm_labels": {},
+        "theta_fields": {},
+        "pred_total": 0,
+        "pred_target": 0,
+        "pred_missing_theta": 0,
+    }
+
+    for frame_idx, key in enumerate(common_keys):
         gt_frame = gt_map[key]
         yolo_frame = yolo_map[key]
 
@@ -441,10 +497,34 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
                 gts.append(g)
 
         preds = []
+        frame_debug = {
+            "gt_in_fov_by_cls": {c: 0 for c in target_classes},
+            "pred_by_cls": {c: 0 for c in target_classes},
+            "tp_by_cls": {c: 0 for c in target_classes},
+            "fp_by_cls": {c: 0 for c in target_classes},
+            "fn_by_cls": {c: 0 for c in target_classes},
+            "missing_theta_by_cls": {c: 0 for c in target_classes},
+        }
+        for g in gts:
+            _, _, _, g_label = extract_box_from_gt(g)
+            g_label = normalize_label(g_label)
+            if g_label in frame_debug["gt_in_fov_by_cls"]:
+                frame_debug["gt_in_fov_by_cls"][g_label] += 1
+
         for p in extract_pred_objects(yolo_frame):
-            p_label = normalize_label(extract_yolo_label(p))
+            raw_label = extract_yolo_label(p)
+            p_label = normalize_label(raw_label)
+            theta_field = yolo_theta_field_name(p)
+
+            debug_global["pred_total"] += 1
+            debug_global["raw_labels"][raw_label] = debug_global["raw_labels"].get(raw_label, 0) + 1
+            debug_global["norm_labels"][p_label] = debug_global["norm_labels"].get(p_label, 0) + 1
+            debug_global["theta_fields"][theta_field] = debug_global["theta_fields"].get(theta_field, 0) + 1
+
             if p_label in target_classes:
                 preds.append(p)
+                debug_global["pred_target"] += 1
+                frame_debug["pred_by_cls"][p_label] += 1
 
         matched_gt = set()
         preds_sorted = sorted(preds, key=lambda x: float(x.get("score", 1.0)), reverse=True)
@@ -455,6 +535,9 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
             if not p_theta_candidates:
                 # 无方向信息无法参与 theta 匹配
                 stats[p_label]["fp"] += 1
+                frame_debug["fp_by_cls"][p_label] += 1
+                frame_debug["missing_theta_by_cls"][p_label] += 1
+                debug_global["pred_missing_theta"] += 1
                 continue
 
             best_diff = 1e9
@@ -479,15 +562,37 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
 
             if best_gt_idx is not None and best_diff <= YOLO_THETA_THRESH_DEG:
                 stats[p_label]["tp"] += 1
+                frame_debug["tp_by_cls"][p_label] += 1
                 matched_gt.add(best_gt_idx)
             else:
                 stats[p_label]["fp"] += 1
+                frame_debug["fp_by_cls"][p_label] += 1
 
         for gt_idx, gt in enumerate(gts):
             if gt_idx not in matched_gt:
                 _, _, _, g_label = extract_box_from_gt(gt)
                 g_label = normalize_label(g_label)
                 stats[g_label]["fn"] += 1
+                frame_debug["fn_by_cls"][g_label] += 1
+
+        if DEBUG_YOLO and frame_idx < DEBUG_MAX_FRAMES:
+            print(f"[YOLO Debug][Frame {frame_idx}] key={key}")
+            print(f"  GT(in_fov): {frame_debug['gt_in_fov_by_cls']}")
+            print(f"  Pred      : {frame_debug['pred_by_cls']}")
+            print(f"  TP        : {frame_debug['tp_by_cls']}")
+            print(f"  FP        : {frame_debug['fp_by_cls']}")
+            print(f"  FN        : {frame_debug['fn_by_cls']}")
+            print(f"  Missingθ  : {frame_debug['missing_theta_by_cls']}")
+
+    if DEBUG_YOLO:
+        print("[YOLO Debug] Global summary:")
+        print(f"  pred_total={debug_global['pred_total']}, pred_target={debug_global['pred_target']}, pred_missing_theta={debug_global['pred_missing_theta']}")
+        top_raw = sorted(debug_global["raw_labels"].items(), key=lambda x: x[1], reverse=True)[:12]
+        top_norm = sorted(debug_global["norm_labels"].items(), key=lambda x: x[1], reverse=True)[:12]
+        top_theta = sorted(debug_global["theta_fields"].items(), key=lambda x: x[1], reverse=True)
+        print(f"  top raw labels : {top_raw}")
+        print(f"  top norm labels: {top_norm}")
+        print(f"  theta fields   : {top_theta}")
 
     return stats
 
