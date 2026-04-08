@@ -821,6 +821,7 @@ def fuse(
     if not allow_cross_sensor_match:
         logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅输出 PVRCNN")
 
+    mode_tag = "theta 粗估"
     proj_bboxes = [
         theta_to_proj_bbox(d)
         if d.get("camera_visible", True) else None
