@@ -61,15 +61,18 @@ def dual_confidence_filter(detections, track_conf_state):
     for det in detections:
         track_id = det.get("track_id")
         det_conf = clamp01(det.get("fused_score", det.get("score", 0.0)))
-        prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
-        track_conf = prev_track_conf * TRACK_CONF_DECAY
+        if track_id is None:
+            track_conf = det_conf
+        else:
+            prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
+            track_conf = prev_track_conf * TRACK_CONF_DECAY
 
-        if det.get("matched_2d"):
-            track_conf += TRACK_CONF_BOOST_MATCHED
-        if det.get("motion_prior", 0.0) >= 0.35:
-            track_conf += TRACK_CONF_BOOST_MOTION
-        track_conf = clamp01(track_conf)
-        track_conf_state[track_id] = track_conf
+            if det.get("matched_2d"):
+                track_conf += TRACK_CONF_BOOST_MATCHED
+            if det.get("motion_prior", 0.0) >= 0.35:
+                track_conf += TRACK_CONF_BOOST_MOTION
+            track_conf = clamp01(track_conf)
+            track_conf_state[track_id] = track_conf
 
         combined_conf = DUAL_CONF_ALPHA * det_conf + (1.0 - DUAL_CONF_ALPHA) * track_conf
         keep = (det_conf >= DET_CONF_KEEP_THRESH) or (combined_conf >= DUAL_CONF_RECOVER_THRESH)
@@ -148,8 +151,9 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         else:
             heading = float(st.get("last_heading", 0.0))
 
-        px = float(trk.x[0] + vx * dt_s)
-        py = float(trk.x[1] + vy * dt_s)
+        # trk.x 已是当前帧时刻状态，避免再次外推导致补框与实测错位
+        px = float(trk.x[0])
+        py = float(trk.x[1])
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
