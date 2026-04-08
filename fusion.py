@@ -683,6 +683,13 @@ class KalmanTracker:
             [dt3/2,0,dt2,0],  [0,dt3/2,0,dt2]
         ], dtype=np.float64)
 
+    def _speed_cap(self) -> float:
+        if self.label == "pedestrian":
+            return 4.0
+        if self.label == "cyclist":
+            return 12.0
+        return 30.0
+
     def predict(self, timestamp: str) -> np.ndarray:
         dt     = max(self._calc_dt(timestamp), 1e-3)
         F      = self._F(dt)
@@ -722,8 +729,9 @@ class KalmanTracker:
         if dt_meas > 0.0:
             meas_v = (z - self.prev_meas) / dt_meas
             speed = float(np.linalg.norm(meas_v))
-            if speed > 30.0:
-                meas_v *= (30.0 / speed)
+            speed_cap = self._speed_cap()
+            if speed > speed_cap:
+                meas_v *= (speed_cap / speed)
             self.x[2:] = meas_v
 
         self.prev_meas = z.copy()
@@ -747,7 +755,7 @@ class KalmanTracker:
 # PART 6  多目标跟踪管理器
 # ============================================================
 class MultiObjectTracker:
-    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 5.0, track_labels: Optional[set] = None):
+    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 3.0, track_labels: Optional[set] = None):
         self.tracks     : List[KalmanTracker] = []
         self.max_miss   = max_miss
         self.match_dist = match_dist

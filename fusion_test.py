@@ -27,6 +27,7 @@ RECOVERY_MIN_YOLO_SCORE = 0.55
 RECOVERY_MAX_THETA_DIFF = 9.0
 RANGE_FILTER_BY_LABEL = {"car": 42.0}  # 保留 42m 距离过滤，主要面向 car
 ENABLE_TRACK_PREDICTION_RECOVERY = True  # 使用卡尔曼预测补框，缓解短时漏检
+MAX_RECOVERY_STEP_M = 1.8  # 单帧恢复位置最大步长，抑制“闪现”
 
 
 def load_json(path):
@@ -113,6 +114,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "last_dimensions": det.get("dimensions", [4.0, 1.8, 1.6]),
             "last_heading": det.get("heading", 0.0),
             "label": det.get("label", ""),
+            "last_center": list(det.get("center", [0.0, 0.0, 0.0])),
         })
         # 只要本帧被观测到（尤其是 cyclist/pedestrian 的 PVRCNN 观测），就应提升轨迹强度，
         # 否则会出现“从未进入可预测状态”的问题。
@@ -123,6 +125,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         st["last_dimensions"] = det.get("dimensions", st["last_dimensions"])
         st["last_heading"] = det.get("heading", st["last_heading"])
         st["label"] = det.get("label", st.get("label", ""))
+        st["last_center"] = list(det.get("center", st.get("last_center", [0.0, 0.0, 0.0])))
         track_state[tid] = st
         observed_ids.add(tid)
 
@@ -156,9 +159,15 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         else:
             heading = float(st.get("last_heading", 0.0))
 
-        # 当前位置使用“当前帧预测状态 + 一小步速度前推”，用于显式位置预测
+        # 当前位置使用“当前帧预测状态 + 一小步速度前推”，并限制最大步长抑制跳变
         px = float(trk.x[0] + vx * dt_s)
         py = float(trk.x[1] + vy * dt_s)
+        lx, ly, _ = st.get("last_center", [px, py, 0.0])
+        step = math.hypot(px - lx, py - ly)
+        if step > MAX_RECOVERY_STEP_M:
+            scale = MAX_RECOVERY_STEP_M / max(step, 1e-6)
+            px = float(lx + (px - lx) * scale)
+            py = float(ly + (py - ly) * scale)
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
@@ -182,6 +191,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         }
         st["strength"] = new_strength
         st["last_heading"] = heading
+        st["last_center"] = [px, py, 0.0]
         track_state[tid] = st
         out.append(rec)
 
