@@ -113,6 +113,54 @@ def load_frames_from_json(path):
     raise ValueError(f"Unsupported JSON format: {path}")
 
 
+def canonicalize_frame_token(token):
+    if token is None:
+        return None
+
+    s = str(token).strip()
+    if not s:
+        return None
+
+    stem = Path(s).stem
+    low = stem.lower()
+
+    if low.startswith("frame_"):
+        low = low[6:]
+    elif low.startswith("frame"):
+        low = low[5:]
+
+    if low.isdigit():
+        return str(int(low))
+
+    return low
+
+
+def frame_lookup_keys(frame):
+    keys = []
+
+    for field in ("filename", "image_path", "image_file", "frame_name"):
+        v = frame.get(field)
+        k = canonicalize_frame_token(v)
+        if k is not None:
+            keys.append(k)
+
+    frame_id = frame.get("frame_id")
+    if frame_id is not None:
+        keys.append(str(frame_id))
+        keys.append(canonicalize_frame_token(frame_id))
+
+    # 保序去重
+    dedup = []
+    seen = set()
+    for k in keys:
+        if k is None:
+            continue
+        if k not in seen:
+            seen.add(k)
+            dedup.append(k)
+    return dedup
+
+
 def build_frame_map_from_big_json(path, max_frames=60):
     frames = load_frames_from_json(path)
     out = {}
@@ -122,9 +170,14 @@ def build_frame_map_from_big_json(path, max_frames=60):
         if frame_id is not None and frame_id >= max_frames:
             continue
 
-        filename = frame.get("filename", f"frame_{frame.get('frame_id', 0)}")
-        key = Path(filename).stem
-        out[key] = frame
+        keys = frame_lookup_keys(frame)
+        if not keys:
+            filename = frame.get("filename", f"frame_{frame.get('frame_id', 0)}")
+            keys = [canonicalize_frame_token(filename)]
+
+        for key in keys:
+            if key is not None and key not in out:
+                out[key] = frame
 
     return out
 
@@ -148,8 +201,12 @@ def build_frame_map_from_dir(dir_path, max_frames=60):
         if frame_id is not None and frame_id >= max_frames:
             continue
 
-        key = json_file.stem
-        out[key] = frame
+        keys = [canonicalize_frame_token(json_file.stem)]
+        keys.extend(frame_lookup_keys(frame))
+
+        for key in keys:
+            if key is not None and key not in out:
+                out[key] = frame
 
     return out
 
@@ -254,6 +311,26 @@ def angle_diff_deg(a, b):
     return min(d, 360.0 - d)
 
 
+def extract_yolo_label(pred):
+    for field in ("label", "class_label", "class_name", "name"):
+        v = pred.get(field)
+        if v is not None:
+            return str(v)
+    return "Unknown"
+
+
+def extract_yolo_theta_deg(pred):
+    # 常见字段：theta/theta_deg/angle/alpha
+    for field in ("theta_deg", "theta", "angle", "alpha"):
+        if field in pred:
+            theta = float(pred[field])
+            # 如果是弧度，转换成角度
+            if abs(theta) <= (2.0 * math.pi + 1e-6):
+                theta = math.degrees(theta)
+            return theta
+    return None
+
+
 # ============================================================
 # 7. 评估 3D 方法：PVRCNN / Fusion
 # ============================================================
@@ -344,17 +421,22 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
             if g_label in target_classes and in_camera_fov(g_center):
                 gts.append(g)
 
-        preds = [
-            p for p in extract_pred_objects(yolo_frame)
-            if normalize_label(p["label"]) in target_classes
-        ]
+        preds = []
+        for p in extract_pred_objects(yolo_frame):
+            p_label = normalize_label(extract_yolo_label(p))
+            if p_label in target_classes:
+                preds.append(p)
 
         matched_gt = set()
         preds_sorted = sorted(preds, key=lambda x: float(x.get("score", 1.0)), reverse=True)
 
         for pred in preds_sorted:
-            p_label = normalize_label(pred["label"])
-            p_theta = float(pred["theta"])
+            p_label = normalize_label(extract_yolo_label(pred))
+            p_theta = extract_yolo_theta_deg(pred)
+            if p_theta is None:
+                # 无方向信息无法参与 theta 匹配
+                stats[p_label]["fp"] += 1
+                continue
 
             best_diff = 1e9
             best_gt_idx = None
