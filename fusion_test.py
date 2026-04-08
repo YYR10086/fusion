@@ -1,5 +1,6 @@
 import json
 import math
+from datetime import datetime
 from fusion import (
     KITTICalib,
     MultiObjectTracker,
@@ -35,6 +36,15 @@ def load_json(path):
 
 def clamp01(x):
     return max(0.0, min(1.0, float(x)))
+
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 
 def dual_confidence_filter(detections, track_conf_state):
@@ -78,7 +88,7 @@ def dual_confidence_filter(detections, track_conf_state):
     return filtered
 
 
-def apply_track_strength_recovery(observed_dets, mot, track_state):
+def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
     """
     按“0.5 -> 1.0 -> 0.5 -> 删除”规则进行跟踪补框：
     - 新轨迹默认强度 0.5；
@@ -138,12 +148,14 @@ def apply_track_strength_recovery(observed_dets, mot, track_state):
         else:
             heading = float(st.get("last_heading", 0.0))
 
+        px = float(trk.x[0] + vx * dt_s)
+        py = float(trk.x[1] + vy * dt_s)
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
             "score": round(0.3 * new_strength, 4),
             "fused_score": round(0.3 * new_strength, 4),
-            "center": [float(trk.x[0]), float(trk.x[1]), 0.0],
+            "center": [px, py, 0.0],
             "dimensions": st.get("last_dimensions", [4.0, 1.8, 1.6]),
             "heading": heading,
             "proj_bbox": None,
@@ -157,6 +169,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state):
             "velocity": [round(vx, 3), round(vy, 3)],
             "track_strength": round(new_strength, 2),
             "recovered_by_track_strength": True,
+            "prediction_dt_s": round(float(dt_s), 3),
         }
         st["strength"] = new_strength
         st["last_heading"] = heading
@@ -180,6 +193,7 @@ def main():
     mot = MultiObjectTracker()
     track_conf_state = {}
     track_strength_state = {}
+    prev_timestamp = None
 
     all_results = []
     stats = {
@@ -248,8 +262,14 @@ def main():
         )
 
         tracked = mot.update(fused, timestamp) if timestamp else fused
+        dt_s = 0.1
+        cur_ts = parse_ts(timestamp)
+        if cur_ts is not None and prev_timestamp is not None:
+            dt_s = max((cur_ts - prev_timestamp).total_seconds(), 0.0)
+        if cur_ts is not None:
+            prev_timestamp = cur_ts
         output_dets = tracked if USE_TRACKING else tracked
-        output_dets = apply_track_strength_recovery(output_dets, mot, track_strength_state)
+        output_dets = apply_track_strength_recovery(output_dets, mot, track_strength_state, dt_s=dt_s)
         output_dets = dual_confidence_filter(output_dets, track_conf_state)
         if not output_dets:
             continue
