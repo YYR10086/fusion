@@ -32,8 +32,8 @@ logger = logging.getLogger("Fusion")
 CAMERA_FOV_DEG  = 150.0
 CAMERA_FOV_MARGIN_DEG = 8.0      # 视场边缘安全裕量，防止边界误检
 CAMERA_MAX_RANGE_M = 45.0        # 超过该距离默认不参与相机融合
-CAR_FRONT_MAX_X_M = 20.0         # car 前向门限：正前方 x 超过该值直接过滤（更激进）
-FORWARD_X_FILTER_BY_LABEL = {"car": CAR_FRONT_MAX_X_M}
+CAR_MAX_RANGE_M = 42.0
+RANGE_FILTER_BY_LABEL: Dict[str, float] = {"car": CAR_MAX_RANGE_M}  # 保留 42m 过滤（主要面向 car）
 MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
@@ -794,17 +794,16 @@ class MultiObjectTracker:
         return d
 
 
-def within_label_forward_x(det: Dict, forward_x_filter_by_label: Optional[Dict[str, float]] = None) -> bool:
-    """按类别前向 x 阈值过滤（默认仅 car），用于更激进抑制正前方远距误检。"""
-    if forward_x_filter_by_label is None:
-        forward_x_filter_by_label = FORWARD_X_FILTER_BY_LABEL
+def within_label_range(det: Dict, range_filter_by_label: Optional[Dict[str, float]] = None) -> bool:
+    """按类别距离阈值过滤（默认 car=42m），用于抑制远距误检。"""
+    if range_filter_by_label is None:
+        range_filter_by_label = RANGE_FILTER_BY_LABEL
     label = str(det.get("label", "")).lower()
-    max_forward_x = forward_x_filter_by_label.get(label)
-    if max_forward_x is None:
+    max_range = range_filter_by_label.get(label)
+    if max_range is None:
         return True
-    cx, _, _ = det.get("center", [0.0, 0.0, 0.0])
-    # 仅约束正前方（x>0）方向，不做半径/欧氏距离过滤
-    return float(cx) <= float(max_forward_x)
+    cx, cy, _ = det.get("center", [0.0, 0.0, 0.0])
+    return float(np.hypot(cx, cy)) <= float(max_range)
 
 # ============================================================
 # PART 7  融合
@@ -818,9 +817,10 @@ def fuse(
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
         include_unmatched_yolo: bool = False,
+        include_track_predictions: bool = False,
         camera_fov_only: bool = False,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
-        forward_x_filter_by_label: Optional[Dict[str, float]] = None,
+        range_filter_by_label: Optional[Dict[str, float]] = None,
 ) -> List[Dict]:
     del w_pvrcnn, w_yolo, camera_fov_only
 
@@ -829,8 +829,8 @@ def fuse(
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
 
-    # 按类别前向 x 阈值做预过滤（默认仅 car），更激进抑制正前方远距误检
-    det3d = [d for d in det3d if within_label_forward_x(d, forward_x_filter_by_label)]
+    # 按类别距离阈值做预过滤（默认 car=42m）
+    det3d = [d for d in det3d if within_label_range(d, range_filter_by_label)]
 
     # 仅保留高于最小置信度的 PVRCNN 目标（输出准入条件）
     det3d = [d for d in det3d if d["score"] >= PVRCNN_MIN_KEEP_SCORE]
@@ -1012,6 +1012,48 @@ def fuse(
                 "recovered_by_track_yolo": True,
                 "recovery_track_id": best_pred.get("track_id"),
             })
+
+    if include_track_predictions and motion_predictions:
+        # 轨迹补框：当前帧短时漏检时，用卡尔曼预测位置补一个低分框
+        for pred in motion_predictions:
+            px, py = pred.get("pred_center", [0.0, 0.0])
+            label = pred.get("label", "")
+            if not label:
+                continue
+            if any(
+                fd["label"] == label and
+                float(np.hypot(fd["center"][0] - px, fd["center"][1] - py)) <= 2.5
+                for fd in fused
+            ):
+                continue
+
+            dims = CLASS_SIZE_PRIOR.get(label, [4.0, 1.8, 1.6])
+            heading = float(np.arctan2(py, max(px, 1e-6)))
+            pred_det = {
+                "label": label,
+                "camera_label": "",
+                "score": 0.30,
+                "fused_score": 0.30,
+                "center": [float(px), float(py), 0.0],
+                "dimensions": dims,
+                "heading": heading,
+                "matched_2d": False,
+                "yolo_assisted": False,
+                "yolo_conf": 0.0,
+                "match_quality": 0.0,
+                "motion_prior": 1.0,
+                "fusion_mode": f"{mode_tag}+track_prediction",
+                "timestamp": ts3,
+                "source": "track_prediction",
+                "camera_visible": True,
+                "recovered_by_track_prediction": True,
+                "recovery_track_id": pred.get("track_id"),
+            }
+            pred_det["proj_bbox"] = (
+                calib.box3d_to_bbox2d(pred_det["center"], pred_det["dimensions"], pred_det["heading"])
+                if calib.use_calib else theta_to_proj_bbox(pred_det)
+            )
+            fused.append(pred_det)
 
     fused.sort(key=lambda x: x["fused_score"], reverse=True)
     return fused
