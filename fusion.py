@@ -821,7 +821,6 @@ def fuse(
     if not allow_cross_sensor_match:
         logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅输出 PVRCNN")
 
-    mode_tag = "theta 粗估"
     proj_bboxes = [
         theta_to_proj_bbox(d)
         if d.get("camera_visible", True) else None
@@ -916,7 +915,7 @@ def fuse(
             "yolo_conf": round(best_yolo_conf if matched else 0.0, 4),
             "match_quality": round(best_quality if matched else 0.0, 4),
             "motion_prior": round(motion_prior_score(d3["center"], d3["label"], motion_predictions), 4),
-            "fusion_mode": mode_tag,
+            "fusion_mode": "theta",
             "timestamp": d3["timestamp"],
             "source": "pvrcnn",
             "camera_visible": d3.get("camera_visible", True),
@@ -976,7 +975,7 @@ def fuse(
                 "yolo_conf": round(d2["score"], 4),
                 "match_quality": round(theta_sim, 4),
                 "motion_prior": round(theta_sim, 4),
-                "fusion_mode": f"{mode_tag}+track_yolo_recover",
+                "fusion_mode": "theta+track_yolo_recover",
                 "timestamp": d2.get("timestamp", ts3),
                 "source": "track_yolo_recover",
                 "camera_visible": True,
@@ -1013,7 +1012,7 @@ def fuse(
                 "yolo_conf": 0.0,
                 "match_quality": 0.0,
                 "motion_prior": 1.0,
-                "fusion_mode": f"{mode_tag}+track_prediction",
+                "fusion_mode": "theta+track_prediction",
                 "timestamp": ts3,
                 "source": "track_prediction",
                 "camera_visible": True,
@@ -1062,10 +1061,10 @@ def visualize_bev(
         tid      = d.get("track_id", "?")
         vx, vy   = d.get("velocity", [0, 0])
         speed    = round((vx**2 + vy**2)**0.5, 2)
-        mode_tag = "C" if d.get("fusion_mode") == "标定投影" else "T"  # C=Calib T=Theta
+        mode_prefix = "T" if str(d.get("fusion_mode", "")).startswith("theta") else "U"  # T=Theta U=Unknown
         lpos     = w2c(cx, cy)
         cv2.putText(canvas,
-                    f"[{mode_tag}]{d['label']}#{tid} {d['fused_score']:.2f} {speed}m/s",
+                    f"[{mode_prefix}]{d['label']}#{tid} {d['fused_score']:.2f} {speed}m/s",
                     (lpos[0]-30, lpos[1]-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.33, (60, 60, 60), 1)
 
