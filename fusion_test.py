@@ -1,4 +1,5 @@
 import json
+import math
 from fusion import (
     KITTICalib,
     MultiObjectTracker,
@@ -77,6 +78,94 @@ def dual_confidence_filter(detections, track_conf_state):
     return filtered
 
 
+def apply_track_strength_recovery(observed_dets, mot, track_state):
+    """
+    按“0.5 -> 1.0 -> 0.5 -> 删除”规则进行跟踪补框：
+    - 新轨迹默认强度 0.5；
+    - 当前帧有同类图像确认（matched_2d=True）时，强度提到 1.0；
+    - 缺失一帧：若上次为 1.0 则降到 0.5 并保留预测框；若上次为 0.5 则直接删除。
+    """
+    out = []
+    observed_ids = set()
+
+    for det in observed_dets:
+        tid = det.get("track_id")
+        if tid is None:
+            out.append(det)
+            continue
+        st = track_state.get(tid, {
+            "strength": 0.5,
+            "last_dimensions": det.get("dimensions", [4.0, 1.8, 1.6]),
+            "last_heading": det.get("heading", 0.0),
+            "label": det.get("label", ""),
+        })
+        if det.get("matched_2d"):
+            st["strength"] = 1.0
+        else:
+            st["strength"] = max(st.get("strength", 0.5), 0.5)
+        st["last_dimensions"] = det.get("dimensions", st["last_dimensions"])
+        st["last_heading"] = det.get("heading", st["last_heading"])
+        st["label"] = det.get("label", st.get("label", ""))
+        track_state[tid] = st
+        observed_ids.add(tid)
+
+        det_out = dict(det)
+        det_out["track_strength"] = round(st["strength"], 2)
+        out.append(det_out)
+
+    if not ENABLE_TRACK_PREDICTION_RECOVERY:
+        return out
+
+    # 对“当前帧缺失但轨迹还连续”的目标进行补框
+    for trk in mot.tracks:
+        tid = trk.track_id
+        if tid in observed_ids:
+            continue
+        st = track_state.get(tid)
+        if st is None:
+            continue
+
+        prev_strength = float(st.get("strength", 0.5))
+        new_strength = 0.5 if prev_strength >= 1.0 else 0.0
+        if new_strength <= 0.0:
+            track_state.pop(tid, None)
+            continue
+
+        vx, vy = trk.get_velocity()
+        speed = math.hypot(vx, vy)
+        if speed >= 0.1:
+            heading = float(math.atan2(vy, vx))
+        else:
+            heading = float(st.get("last_heading", 0.0))
+
+        rec = {
+            "label": st.get("label", trk.label),
+            "camera_label": "",
+            "score": round(0.3 * new_strength, 4),
+            "fused_score": round(0.3 * new_strength, 4),
+            "center": [float(trk.x[0]), float(trk.x[1]), 0.0],
+            "dimensions": st.get("last_dimensions", [4.0, 1.8, 1.6]),
+            "heading": heading,
+            "proj_bbox": None,
+            "matched_2d": False,
+            "yolo_assisted": False,
+            "yolo_conf": 0.0,
+            "match_quality": 0.0,
+            "motion_prior": 1.0,
+            "source": "track_strength_recover",
+            "track_id": tid,
+            "velocity": [round(vx, 3), round(vy, 3)],
+            "track_strength": round(new_strength, 2),
+            "recovered_by_track_strength": True,
+        }
+        st["strength"] = new_strength
+        st["last_heading"] = heading
+        track_state[tid] = st
+        out.append(rec)
+
+    return out
+
+
 def main():
     yolo_data = load_json(YOLO_JSON)
     pvrcnn_data = load_json(PVRCNN_JSON)
@@ -90,6 +179,7 @@ def main():
     calib = KITTICalib("calib.txt")
     mot = MultiObjectTracker()
     track_conf_state = {}
+    track_strength_state = {}
 
     all_results = []
     stats = {
@@ -141,7 +231,7 @@ def main():
             ),
             # 与当前融合策略保持一致：YOLO 仅辅助，不输出 YOLO-only 目标
             include_unmatched_yolo=ENABLE_TRACK_YOLO_RECOVERY,
-            include_track_predictions=ENABLE_TRACK_PREDICTION_RECOVERY,
+            include_track_predictions=False,  # 关闭旧补框逻辑，改用下方强度状态机
             unmatched_yolo_min_score=RECOVERY_MIN_YOLO_SCORE,
             camera_fov_only=False,
             range_filter_by_label=RANGE_FILTER_BY_LABEL,
@@ -157,17 +247,17 @@ def main():
             if (not d.get("matched_2d")) and d.get("center") == [0, 0, 0]
         )
 
-        if fused:
-            tracked = mot.update(fused, timestamp) if timestamp else fused
-            output_dets = tracked if USE_TRACKING else fused
-            output_dets = dual_confidence_filter(output_dets, track_conf_state)
-            if not output_dets:
-                continue
-            all_results.append({
-                "frame_id": idx,
-                "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
-                "detections": output_dets
-            })
+        tracked = mot.update(fused, timestamp) if timestamp else fused
+        output_dets = tracked if USE_TRACKING else tracked
+        output_dets = apply_track_strength_recovery(output_dets, mot, track_strength_state)
+        output_dets = dual_confidence_filter(output_dets, track_conf_state)
+        if not output_dets:
+            continue
+        all_results.append({
+            "frame_id": idx,
+            "filename": pvrcnn_frame.get("filename", yolo_frame.get("filename", "")),
+            "detections": output_dets
+        })
 
     output = {
         "meta": {
@@ -186,6 +276,12 @@ def main():
             },
             "range_filter_by_label": RANGE_FILTER_BY_LABEL,
             "enable_track_prediction_recovery": ENABLE_TRACK_PREDICTION_RECOVERY,
+            "track_strength_rule": {
+                "initial_strength": 0.5,
+                "match_raise_to": 1.0,
+                "first_miss_drop_to": 0.5,
+                "second_miss_drop": "remove",
+            },
             "track_yolo_recover_params": {
                 "enable_track_yolo_recovery": ENABLE_TRACK_YOLO_RECOVERY,
                 "recovery_min_yolo_score": RECOVERY_MIN_YOLO_SCORE,

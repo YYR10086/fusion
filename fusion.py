@@ -729,6 +729,12 @@ class MultiObjectTracker:
         if not self.tracks:
             return [self._attach(dict(d), self._new_track(d, timestamp), [0.0, 0.0])
                     for d in detections]
+        if not detections:
+            for trk in self.tracks:
+                trk.predict(timestamp)
+                trk.miss_count += 1
+            self.tracks = [t for t in self.tracks if t.miss_count <= self.max_miss]
+            return []
 
         pred_pos = np.array([t.predict(timestamp) for t in self.tracks])
         det_pos  = np.array([[d["center"][0], d["center"][1]] for d in detections])
