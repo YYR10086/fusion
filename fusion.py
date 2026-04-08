@@ -88,6 +88,7 @@ OUTPUT_DIR      = "./fusion_output"
 CALIB_PATH      = "calib.txt"# kitti格式标定文件路径
 
 CANONICAL_LABELS = {"car", "bus", "truck", "pedestrian", "cyclist"}
+TRACK_FOCUS_LABELS = {"pedestrian", "cyclist"}  # 仅对弱小目标启用跟踪/速度估计
 
 # YOLO 原始标签 -> 统一标签
 YOLO_TO_CANONICAL: Dict[str, str] = {
@@ -661,7 +662,6 @@ class KalmanTracker:
         self.last_ts    = timestamp
         self.prev_meas = np.array([x, y], dtype=np.float64)
         self.prev_meas_ts = timestamp
-        self.vel_ema = np.array([0.0, 0.0], dtype=np.float64)
         self.x = np.array([x, y, 0.0, 0.0], dtype=np.float64)
         self.P = np.diag([10.0, 10.0, 100.0, 100.0])
         self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float64)
@@ -707,19 +707,16 @@ class KalmanTracker:
         self.x = self.x + K @ innovation
         self.P = (np.eye(4) - K @ self.H) @ self.P
 
-        # 基于相邻观测点计算速度，并与卡尔曼速度融合，降低速度抖动
+        # 速度估计改为“两帧法”：仅用当前帧与上一帧观测差分
         t_cur = parse_timestamp(timestamp) if timestamp else None
         t_prev = parse_timestamp(self.prev_meas_ts) if self.prev_meas_ts else None
         dt_meas = (t_cur - t_prev).total_seconds() if (t_cur and t_prev) else 0.0
         if dt_meas > 1e-3:
             meas_v = (z - self.prev_meas) / dt_meas
-            kf_v = self.x[2:].copy()
-            blend_v = 0.6 * meas_v + 0.4 * kf_v
-            speed = float(np.linalg.norm(blend_v))
-            if speed > 45.0:
-                blend_v *= (45.0 / speed)
-            self.vel_ema = 0.7 * self.vel_ema + 0.3 * blend_v
-            self.x[2:] = self.vel_ema
+            speed = float(np.linalg.norm(meas_v))
+            if speed > 30.0:
+                meas_v *= (30.0 / speed)
+            self.x[2:] = meas_v
 
         self.prev_meas = z.copy()
         if timestamp:
@@ -741,40 +738,53 @@ class KalmanTracker:
 # PART 6  多目标跟踪管理器
 # ============================================================
 class MultiObjectTracker:
-    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 5.0):
+    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 5.0, track_labels: Optional[set] = None):
         self.tracks     : List[KalmanTracker] = []
         self.max_miss   = max_miss
         self.match_dist = match_dist
+        self.track_labels = set(track_labels or TRACK_FOCUS_LABELS)
 
     def update(self, detections: List[Dict], timestamp: str) -> List[Dict]:
-        if not self.tracks:
-            return [self._attach(dict(d), self._new_track(d, timestamp), [0.0, 0.0])
-                    for d in detections]
-        if not detections:
+        focus_dets, passthrough = [], []
+        for d in detections:
+            if d.get("label") in self.track_labels:
+                focus_dets.append(d)
+            else:
+                passthrough.append(self._attach_passthrough(dict(d)))
+
+        if not self.tracks and focus_dets:
+            tracked = [self._attach(dict(d), self._new_track(d, timestamp), [0.0, 0.0])
+                       for d in focus_dets]
+            out = tracked + passthrough
+            out.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
+            return out
+
+        if not focus_dets:
             for trk in self.tracks:
                 trk.predict(timestamp)
                 trk.miss_count += 1
             self.tracks = [t for t in self.tracks if t.miss_count <= self.max_miss]
-            return []
+            passthrough.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
+            return passthrough
 
-        pred_pos = np.array([t.predict(timestamp) for t in self.tracks])
-        det_pos  = np.array([[d["center"][0], d["center"][1]] for d in detections])
-        dist_mat = np.linalg.norm(pred_pos[:, None] - det_pos[None, :], axis=2)
+        pred_pos = np.array([t.predict(timestamp) for t in self.tracks]) if self.tracks else np.zeros((0, 2))
+        det_pos  = np.array([[d["center"][0], d["center"][1]] for d in focus_dets])
 
-        row_ind, col_ind = linear_sum_assignment(dist_mat)
-        matched_t, matched_d, pairs = set(), set(), {}
-        for r, c in zip(row_ind, col_ind):
-            if (dist_mat[r, c] <= self.match_dist and
-                    self.tracks[r].label == detections[c]["label"]):
-                pairs[r] = c; matched_t.add(r); matched_d.add(c)
+        pairs, matched_t, matched_d = {}, set(), set()
+        if len(self.tracks) > 0:
+            dist_mat = np.linalg.norm(pred_pos[:, None] - det_pos[None, :], axis=2)
+            row_ind, col_ind = linear_sum_assignment(dist_mat)
+            for r, c in zip(row_ind, col_ind):
+                if (dist_mat[r, c] <= self.match_dist and
+                        self.tracks[r].label == focus_dets[c]["label"]):
+                    pairs[r] = c; matched_t.add(r); matched_d.add(c)
 
         smoothed = []
         for t_idx, d_idx in pairs.items():
-            d      = detections[d_idx]
+            d      = focus_dets[d_idx]
             trk    = self.tracks[t_idx]
             trk.update(d["center"][0], d["center"][1], timestamp)
             out    = dict(d)
-            # 若预测与实测为同一目标，保留原始检测框/中心，仅附加速度估计
             out["center"] = [float(d["center"][0]), float(d["center"][1]), float(d["center"][2])]
             smoothed.append(self._attach(out, trk, list(trk.get_velocity())))
 
@@ -783,14 +793,15 @@ class MultiObjectTracker:
                 self.tracks[i].miss_count += 1
         self.tracks = [t for t in self.tracks if t.miss_count <= self.max_miss]
 
-        for j in range(len(detections)):
+        for j in range(len(focus_dets)):
             if j not in matched_d:
-                d   = detections[j]
+                d   = focus_dets[j]
                 trk = self._new_track(d, timestamp)
                 smoothed.append(self._attach(dict(d), trk, [0.0, 0.0]))
 
-        smoothed.sort(key=lambda x: x["fused_score"], reverse=True)
-        return smoothed
+        out = smoothed + passthrough
+        out.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
+        return out
 
     def predict_states(self, timestamp: str, label: Optional[str] = None) -> List[Dict]:
         """
@@ -809,6 +820,12 @@ class MultiObjectTracker:
                 "velocity": [float(vx), float(vy)],
             })
         return states
+
+    @staticmethod
+    def _attach_passthrough(d: Dict) -> Dict:
+        d["track_id"] = None
+        d["velocity"] = [0.0, 0.0]
+        return d
 
     def _new_track(self, d: Dict, ts: str) -> KalmanTracker:
         trk = KalmanTracker(d["center"][0], d["center"][1], d["label"], ts)

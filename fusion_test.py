@@ -61,15 +61,18 @@ def dual_confidence_filter(detections, track_conf_state):
     for det in detections:
         track_id = det.get("track_id")
         det_conf = clamp01(det.get("fused_score", det.get("score", 0.0)))
-        prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
-        track_conf = prev_track_conf * TRACK_CONF_DECAY
+        if track_id is None:
+            track_conf = det_conf
+        else:
+            prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
+            track_conf = prev_track_conf * TRACK_CONF_DECAY
 
-        if det.get("matched_2d"):
-            track_conf += TRACK_CONF_BOOST_MATCHED
-        if det.get("motion_prior", 0.0) >= 0.35:
-            track_conf += TRACK_CONF_BOOST_MOTION
-        track_conf = clamp01(track_conf)
-        track_conf_state[track_id] = track_conf
+            if det.get("matched_2d"):
+                track_conf += TRACK_CONF_BOOST_MATCHED
+            if det.get("motion_prior", 0.0) >= 0.35:
+                track_conf += TRACK_CONF_BOOST_MOTION
+            track_conf = clamp01(track_conf)
+            track_conf_state[track_id] = track_conf
 
         combined_conf = DUAL_CONF_ALPHA * det_conf + (1.0 - DUAL_CONF_ALPHA) * track_conf
         keep = (det_conf >= DET_CONF_KEEP_THRESH) or (combined_conf >= DUAL_CONF_RECOVER_THRESH)
