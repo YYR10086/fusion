@@ -39,9 +39,19 @@ YOLO_THETA_THRESH_DEG = 10.0
 
 # 相机水平视场角
 CAMERA_FOV_DEG = 150.0
+# 相机前向轴:
+# - "x_forward": 前向为 +x（原逻辑）
+# - "y_forward": 前向为 +y（很多数据集/坐标系会这样定义）
+# - "neg_x_forward" / "neg_y_forward"
+# - "auto": 自动从 GT 中选择使 FOV 内目标最多的轴
+CAMERA_FORWARD_AXIS = "auto"
 
 # 是否允许类别组匹配
 ALLOW_GROUP_MATCH = False
+
+# YOLO 调试开关（定位 car / cyclist 为什么为 0）
+DEBUG_YOLO = True
+DEBUG_MAX_FRAMES = 8
 
 # YOLO 调试开关（定位 car / cyclist 为什么为 0）
 DEBUG_YOLO = True
@@ -307,19 +317,88 @@ def bev_iou(center1, dims1, yaw1, center2, dims2, yaw2):
 # 6. YOLO theta 工具
 # ============================================================
 
-def lidar_center_to_theta_deg(center):
+def lidar_center_to_theta_deg(center, forward_axis="x_forward"):
     x, y = center[0], center[1]
-    return math.degrees(math.atan2(y, x))
+    if forward_axis == "x_forward":
+        return math.degrees(math.atan2(y, x))
+    if forward_axis == "y_forward":
+        return math.degrees(math.atan2(x, y))
+    if forward_axis == "neg_x_forward":
+        return math.degrees(math.atan2(y, -x))
+    if forward_axis == "neg_y_forward":
+        return math.degrees(math.atan2(x, -y))
+    raise ValueError(f"Unsupported forward_axis: {forward_axis}")
 
 
-def in_camera_fov(center, fov_deg=CAMERA_FOV_DEG):
-    theta = lidar_center_to_theta_deg(center)
+def in_camera_fov(center, fov_deg=CAMERA_FOV_DEG, forward_axis="x_forward"):
+    theta = lidar_center_to_theta_deg(center, forward_axis=forward_axis)
     return abs(theta) <= fov_deg / 2.0
 
 
 def angle_diff_deg(a, b):
     d = abs(a - b) % 360.0
     return min(d, 360.0 - d)
+
+
+def extract_yolo_label(pred):
+    for field in ("label", "class_label", "class_name", "name"):
+        v = pred.get(field)
+        if v is not None:
+            return str(v)
+    return "Unknown"
+
+
+def extract_yolo_theta_candidates_deg(pred):
+    """
+    返回候选角度（单位：度）。
+    - 明确 *_deg 字段：按度处理
+    - 明确 *_rad 字段：按弧度转度
+    - 模糊字段（theta/angle/alpha）：同时尝试“原值即度”和“弧度转度”
+      以避免小角度度值被误判成弧度导致匹配失败。
+    """
+    for field in ("theta_deg", "angle_deg", "alpha_deg"):
+        if field in pred:
+            return [float(pred[field])]
+
+    for field in ("theta_rad", "angle_rad", "alpha_rad"):
+        if field in pred:
+            return [math.degrees(float(pred[field]))]
+
+    for field in ("theta", "angle", "alpha"):
+        if field in pred:
+            raw = float(pred[field])
+            return [raw, math.degrees(raw)]
+
+    return []
+
+
+def yolo_theta_field_name(pred):
+    for field in ("theta_deg", "angle_deg", "alpha_deg", "theta_rad", "angle_rad", "alpha_rad", "theta", "angle", "alpha"):
+        if field in pred:
+            return field
+    return None
+
+
+def infer_camera_forward_axis(gt_map, common_keys, target_classes):
+    candidate_axes = ["x_forward", "y_forward", "neg_x_forward", "neg_y_forward"]
+    scores = {axis: 0 for axis in candidate_axes}
+
+    # 用前若干个公共帧估计即可，避免太慢
+    sample_keys = common_keys[: min(len(common_keys), 40)]
+    for key in sample_keys:
+        gt_frame = gt_map[key]
+        for g in extract_gt_objects(gt_frame):
+            g_center, _, _, g_label = extract_box_from_gt(g)
+            g_label = normalize_label(g_label)
+            if g_label not in target_classes:
+                continue
+
+            for axis in candidate_axes:
+                if in_camera_fov(g_center, fov_deg=CAMERA_FOV_DEG, forward_axis=axis):
+                    scores[axis] += 1
+
+    best_axis = max(scores.items(), key=lambda kv: kv[1])[0]
+    return best_axis, scores
 
 
 def extract_yolo_label(pred):
@@ -472,6 +551,13 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
         if len(common_keys) == 0:
             print("[YOLO Debug] common_keys=0，请优先检查 GT/YOLO 的 frame key 是否对齐。")
 
+    selected_axis = CAMERA_FORWARD_AXIS
+    if CAMERA_FORWARD_AXIS == "auto" and common_keys:
+        selected_axis, axis_scores = infer_camera_forward_axis(gt_map, common_keys, target_classes)
+        print(f"[YOLO Eval] Auto-selected forward axis: {selected_axis}, scores={axis_scores}")
+    elif common_keys:
+        print(f"[YOLO Eval] Using forward axis: {selected_axis}")
+
     debug_global = {
         "raw_labels": {},
         "norm_labels": {},
@@ -493,7 +579,7 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
             g_center, _, _, g_label = extract_box_from_gt(g)
             g_label = normalize_label(g_label)
 
-            if g_label in target_classes and in_camera_fov(g_center):
+            if g_label in target_classes and in_camera_fov(g_center, forward_axis=selected_axis):
                 gts.append(g)
 
         preds = []
@@ -553,7 +639,7 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
                 if not labels_match(p_label, g_label, allow_group_match=ALLOW_GROUP_MATCH):
                     continue
 
-                g_theta = lidar_center_to_theta_deg(g_center)
+                g_theta = lidar_center_to_theta_deg(g_center, forward_axis=selected_axis)
                 diff = min(angle_diff_deg(p_theta, g_theta) for p_theta in p_theta_candidates)
 
                 if diff < best_diff:
