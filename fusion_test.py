@@ -148,8 +148,9 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         else:
             heading = float(st.get("last_heading", 0.0))
 
-        px = float(trk.x[0] + vx * dt_s)
-        py = float(trk.x[1] + vy * dt_s)
+        # trk.x 已是当前帧时刻状态，避免再次外推导致补框与实测错位
+        px = float(trk.x[0])
+        py = float(trk.x[1])
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
