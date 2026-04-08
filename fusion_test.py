@@ -39,6 +39,11 @@ def clamp01(x):
     return max(0.0, min(1.0, float(x)))
 
 
+def angle_diff_rad(a, b):
+    d = (a - b + math.pi) % (2 * math.pi) - math.pi
+    return abs(d)
+
+
 def parse_ts(ts):
     if not ts:
         return None
@@ -115,6 +120,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "last_heading": det.get("heading", 0.0),
             "label": det.get("label", ""),
             "last_center": list(det.get("center", [0.0, 0.0, 0.0])),
+            "last_speed": 0.0,
         })
         # 只要本帧被观测到（尤其是 cyclist/pedestrian 的 PVRCNN 观测），就应提升轨迹强度，
         # 否则会出现“从未进入可预测状态”的问题。
@@ -126,6 +132,8 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         st["last_heading"] = det.get("heading", st["last_heading"])
         st["label"] = det.get("label", st.get("label", ""))
         st["last_center"] = list(det.get("center", st.get("last_center", [0.0, 0.0, 0.0])))
+        vx0, vy0 = det.get("velocity", [0.0, 0.0])
+        st["last_speed"] = float(math.hypot(vx0, vy0))
         track_state[tid] = st
         observed_ids.add(tid)
 
@@ -149,6 +157,19 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             track_state.pop(tid, None)
             continue
 
+        # 若同类目标已在附近被新轨迹观测到，判为ID切换，删除旧轨迹避免幽灵框
+        lx, ly, _ = st.get("last_center", [0.0, 0.0, 0.0])
+        duplicate_nearby = any(
+            od.get("label") == st.get("label", trk.label) and
+            od.get("track_id") is not None and
+            od.get("track_id") != tid and
+            math.hypot(od.get("center", [0.0, 0.0, 0.0])[0] - lx, od.get("center", [0.0, 0.0, 0.0])[1] - ly) <= 4.0
+            for od in observed_dets
+        )
+        if duplicate_nearby:
+            track_state.pop(tid, None)
+            continue
+
         prev_strength = float(st.get("strength", 0.5))
         # 放宽缺失衰减门限：>=0.7 也允许进入一次预测恢复
         new_strength = 0.5 if prev_strength >= 0.7 else 0.0
@@ -158,10 +179,20 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
 
         vx, vy = trk.get_velocity()
         speed = math.hypot(vx, vy)
+        last_heading = float(st.get("last_heading", 0.0))
         if speed >= 0.1:
-            heading = float(math.atan2(vy, vx))
+            vel_heading = float(math.atan2(vy, vx))
+            # 朝向辅助：若速度方向与历史朝向差异过大，沿历史朝向收缩速度分量
+            if angle_diff_rad(vel_heading, last_heading) > math.radians(60.0):
+                align = math.cos(vel_heading - last_heading)
+                projected_speed = max(0.0, speed * max(align, 0.2))
+                vx = projected_speed * math.cos(last_heading)
+                vy = projected_speed * math.sin(last_heading)
+                speed = projected_speed
+                vel_heading = last_heading
+            heading = vel_heading
         else:
-            heading = float(st.get("last_heading", 0.0))
+            heading = last_heading
 
         # 当前位置使用“当前帧预测状态 + 一小步速度前推”，并限制最大步长抑制跳变
         px = float(trk.x[0] + vx * dt_s)
@@ -196,6 +227,7 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         st["strength"] = new_strength
         st["last_heading"] = heading
         st["last_center"] = [px, py, float(lz)]
+        st["last_speed"] = float(speed)
         track_state[tid] = st
         out.append(rec)
 

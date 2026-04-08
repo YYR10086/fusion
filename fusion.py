@@ -690,6 +690,13 @@ class KalmanTracker:
             return 12.0
         return 30.0
 
+    def _accel_cap(self) -> float:
+        if self.label == "pedestrian":
+            return 2.0
+        if self.label == "cyclist":
+            return 3.5
+        return 6.0
+
     def predict(self, timestamp: str) -> np.ndarray:
         dt     = max(self._calc_dt(timestamp), 1e-3)
         F      = self._F(dt)
@@ -732,6 +739,14 @@ class KalmanTracker:
             speed_cap = self._speed_cap()
             if speed > speed_cap:
                 meas_v *= (speed_cap / speed)
+
+            # 约束加速度，抑制速度突增导致的“闪现”
+            prev_v = self.x[2:].copy()
+            dv = meas_v - prev_v
+            max_dv = self._accel_cap() * dt_meas
+            dv_norm = float(np.linalg.norm(dv))
+            if dv_norm > max_dv > 0.0:
+                meas_v = prev_v + dv * (max_dv / dv_norm)
             self.x[2:] = meas_v
 
         self.prev_meas = z.copy()
