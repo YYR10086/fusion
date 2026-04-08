@@ -49,10 +49,17 @@ ALLOW_GROUP_MATCH = False
 # ============================================================
 
 CLASS_MAP = {
+    "0": "Car",
+    "1": "Pedestrian",
+    "2": "Cyclist",
+    "vehicle": "Car",
     "car": "Car",
     "bus": "Bus",
     "truck": "Truck",
     "van": "Van",
+    "bicyclist": "Cyclist",
+    "bike": "Cyclist",
+    "tricycle": "Cyclist",
     "person": "Pedestrian",
     "pedestrian": "Pedestrian",
     "cyclist": "Cyclist",
@@ -319,16 +326,28 @@ def extract_yolo_label(pred):
     return "Unknown"
 
 
-def extract_yolo_theta_deg(pred):
-    # 常见字段：theta/theta_deg/angle/alpha
-    for field in ("theta_deg", "theta", "angle", "alpha"):
+def extract_yolo_theta_candidates_deg(pred):
+    """
+    返回候选角度（单位：度）。
+    - 明确 *_deg 字段：按度处理
+    - 明确 *_rad 字段：按弧度转度
+    - 模糊字段（theta/angle/alpha）：同时尝试“原值即度”和“弧度转度”
+      以避免小角度度值被误判成弧度导致匹配失败。
+    """
+    for field in ("theta_deg", "angle_deg", "alpha_deg"):
         if field in pred:
-            theta = float(pred[field])
-            # 如果是弧度，转换成角度
-            if abs(theta) <= (2.0 * math.pi + 1e-6):
-                theta = math.degrees(theta)
-            return theta
-    return None
+            return [float(pred[field])]
+
+    for field in ("theta_rad", "angle_rad", "alpha_rad"):
+        if field in pred:
+            return [math.degrees(float(pred[field]))]
+
+    for field in ("theta", "angle", "alpha"):
+        if field in pred:
+            raw = float(pred[field])
+            return [raw, math.degrees(raw)]
+
+    return []
 
 
 # ============================================================
@@ -432,8 +451,8 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
 
         for pred in preds_sorted:
             p_label = normalize_label(extract_yolo_label(pred))
-            p_theta = extract_yolo_theta_deg(pred)
-            if p_theta is None:
+            p_theta_candidates = extract_yolo_theta_candidates_deg(pred)
+            if not p_theta_candidates:
                 # 无方向信息无法参与 theta 匹配
                 stats[p_label]["fp"] += 1
                 continue
@@ -452,7 +471,7 @@ def evaluate_yolo_method(gt_map, yolo_map, target_classes):
                     continue
 
                 g_theta = lidar_center_to_theta_deg(g_center)
-                diff = angle_diff_deg(p_theta, g_theta)
+                diff = min(angle_diff_deg(p_theta, g_theta) for p_theta in p_theta_candidates)
 
                 if diff < best_diff:
                     best_diff = diff
