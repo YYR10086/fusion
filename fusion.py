@@ -32,8 +32,8 @@ logger = logging.getLogger("Fusion")
 CAMERA_FOV_DEG  = 150.0
 CAMERA_FOV_MARGIN_DEG = 8.0      # 视场边缘安全裕量，防止边界误检
 CAMERA_MAX_RANGE_M = 45.0        # 超过该距离默认不参与相机融合
-CAR_MAX_RANGE_M = 42.0           # car 距离门限：超出该范围的 car 直接过滤，降低远距误检
-RANGE_FILTER_BY_LABEL = {"car": CAR_MAX_RANGE_M}
+CAR_FRONT_MAX_X_M = 20.0         # car 前向门限：正前方 x 超过该值直接过滤（更激进）
+FORWARD_X_FILTER_BY_LABEL = {"car": CAR_FRONT_MAX_X_M}
 MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
@@ -794,17 +794,17 @@ class MultiObjectTracker:
         return d
 
 
-def within_label_range(det: Dict, range_filter_by_label: Optional[Dict[str, float]] = None) -> bool:
-    """按类别距离阈值过滤（默认仅 car），用于抑制远距误检。"""
-    if range_filter_by_label is None:
-        range_filter_by_label = RANGE_FILTER_BY_LABEL
+def within_label_forward_x(det: Dict, forward_x_filter_by_label: Optional[Dict[str, float]] = None) -> bool:
+    """按类别前向 x 阈值过滤（默认仅 car），用于更激进抑制正前方远距误检。"""
+    if forward_x_filter_by_label is None:
+        forward_x_filter_by_label = FORWARD_X_FILTER_BY_LABEL
     label = str(det.get("label", "")).lower()
-    max_range = range_filter_by_label.get(label)
-    if max_range is None:
+    max_forward_x = forward_x_filter_by_label.get(label)
+    if max_forward_x is None:
         return True
-    cx, cy, _ = det.get("center", [0.0, 0.0, 0.0])
-    dist_xy = float(np.hypot(cx, cy))
-    return dist_xy <= float(max_range)
+    cx, _, _ = det.get("center", [0.0, 0.0, 0.0])
+    # 仅约束正前方（x>0）方向，不做半径/欧氏距离过滤
+    return float(cx) <= float(max_forward_x)
 
 # ============================================================
 # PART 7  融合
@@ -820,7 +820,7 @@ def fuse(
         include_unmatched_yolo: bool = False,
         camera_fov_only: bool = False,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
-        range_filter_by_label: Optional[Dict[str, float]] = None,
+        forward_x_filter_by_label: Optional[Dict[str, float]] = None,
 ) -> List[Dict]:
     del w_pvrcnn, w_yolo, camera_fov_only
 
@@ -829,8 +829,8 @@ def fuse(
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
 
-    # 按类别距离阈值做预过滤（默认仅 car），抑制远距离误检
-    det3d = [d for d in det3d if within_label_range(d, range_filter_by_label)]
+    # 按类别前向 x 阈值做预过滤（默认仅 car），更激进抑制正前方远距误检
+    det3d = [d for d in det3d if within_label_forward_x(d, forward_x_filter_by_label)]
 
     # 仅保留高于最小置信度的 PVRCNN 目标（输出准入条件）
     det3d = [d for d in det3d if d["score"] >= PVRCNN_MIN_KEEP_SCORE]

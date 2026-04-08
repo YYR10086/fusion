@@ -23,7 +23,7 @@ TRACK_CONF_BOOST_MOTION = 0.12     # motion prior 较高时提升轨迹置信度
 ENABLE_TRACK_YOLO_RECOVERY = True  # 交由 fusion.py 内核执行轨迹+YOLO补检
 RECOVERY_MIN_YOLO_SCORE = 0.55
 RECOVERY_MAX_THETA_DIFF = 9.0
-RANGE_FILTER_BY_LABEL = {"car": 42.0}  # car 超距过滤，降低远距误检
+FORWARD_X_FILTER_BY_LABEL = {"car": 20.0}  # car 正前方更激进过滤：x>20m 直接过滤
 
 
 def load_json(path):
@@ -142,7 +142,7 @@ def main():
             include_unmatched_yolo=ENABLE_TRACK_YOLO_RECOVERY,
             unmatched_yolo_min_score=RECOVERY_MIN_YOLO_SCORE,
             camera_fov_only=False,
-            range_filter_by_label=RANGE_FILTER_BY_LABEL,
+            forward_x_filter_by_label=FORWARD_X_FILTER_BY_LABEL,
         )
         stats["fused_total"] += len(fused)
         stats["matched_2d_total"] += sum(1 for d in fused if d.get("matched_2d"))
@@ -182,7 +182,7 @@ def main():
                 "track_conf_boost_matched": TRACK_CONF_BOOST_MATCHED,
                 "track_conf_boost_motion": TRACK_CONF_BOOST_MOTION,
             },
-            "range_filter_by_label": RANGE_FILTER_BY_LABEL,
+            "forward_x_filter_by_label": FORWARD_X_FILTER_BY_LABEL,
             "track_yolo_recover_params": {
                 "enable_track_yolo_recovery": ENABLE_TRACK_YOLO_RECOVERY,
                 "recovery_min_yolo_score": RECOVERY_MIN_YOLO_SCORE,
