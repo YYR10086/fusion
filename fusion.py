@@ -254,11 +254,17 @@ class KITTICalib:
 # ============================================================
 # PART 4  工具函数
 # ============================================================
+DEFAULT_FRAME_DT_S = 0.1
+
 def parse_timestamp(ts: str) -> Optional[datetime]:
-    try:
-        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
+    if not ts:
         return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(ts, fmt)
+        except Exception:
+            continue
+    return None
 
 def timestamps_aligned(ts1: str, ts2: str, tol_s: float = TIMESTAMP_TOL_S) -> bool:
     t1, t2 = parse_timestamp(ts1), parse_timestamp(ts2)
@@ -711,7 +717,9 @@ class KalmanTracker:
         t_cur = parse_timestamp(timestamp) if timestamp else None
         t_prev = parse_timestamp(self.prev_meas_ts) if self.prev_meas_ts else None
         dt_meas = (t_cur - t_prev).total_seconds() if (t_cur and t_prev) else 0.0
-        if dt_meas > 1e-3:
+        if dt_meas <= 1e-3:
+            dt_meas = DEFAULT_FRAME_DT_S
+        if dt_meas > 0.0:
             meas_v = (z - self.prev_meas) / dt_meas
             speed = float(np.linalg.norm(meas_v))
             if speed > 30.0:
@@ -731,8 +739,9 @@ class KalmanTracker:
         t0 = parse_timestamp(self.last_ts)
         t1 = parse_timestamp(new_ts)
         if t0 is None or t1 is None:
-            return 0.1
-        return max((t1 - t0).total_seconds(), 0.0)
+            return DEFAULT_FRAME_DT_S
+        dt = (t1 - t0).total_seconds()
+        return dt if dt > 1e-3 else DEFAULT_FRAME_DT_S
 
 # ============================================================
 # PART 6  多目标跟踪管理器

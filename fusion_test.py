@@ -41,10 +41,12 @@ def clamp01(x):
 def parse_ts(ts):
     if not ts:
         return None
-    try:
-        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(ts, fmt)
+        except Exception:
+            continue
+    return None
 
 
 def dual_confidence_filter(detections, track_conf_state):
@@ -272,7 +274,8 @@ def main():
         dt_s = 0.1
         cur_ts = parse_ts(timestamp)
         if cur_ts is not None and prev_timestamp is not None:
-            dt_s = max((cur_ts - prev_timestamp).total_seconds(), 0.0)
+            dt_s = (cur_ts - prev_timestamp).total_seconds()
+            dt_s = dt_s if dt_s > 1e-3 else 0.1
         if cur_ts is not None:
             prev_timestamp = cur_ts
         output_dets = tracked if USE_TRACKING else tracked
