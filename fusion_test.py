@@ -27,6 +27,7 @@ RECOVERY_MIN_YOLO_SCORE = 0.55
 RECOVERY_MAX_THETA_DIFF = 9.0
 RANGE_FILTER_BY_LABEL = {"car": 42.0}  # 保留 42m 距离过滤，主要面向 car
 ENABLE_TRACK_PREDICTION_RECOVERY = True  # 使用卡尔曼预测补框，缓解短时漏检
+MAX_RECOVERY_STEP_M = 1.8  # 单帧恢复位置最大步长，抑制“闪现”
 
 
 def load_json(path):
@@ -38,13 +39,20 @@ def clamp01(x):
     return max(0.0, min(1.0, float(x)))
 
 
+def angle_diff_rad(a, b):
+    d = (a - b + math.pi) % (2 * math.pi) - math.pi
+    return abs(d)
+
+
 def parse_ts(ts):
     if not ts:
         return None
-    try:
-        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(ts, fmt)
+        except Exception:
+            continue
+    return None
 
 
 def dual_confidence_filter(detections, track_conf_state):
@@ -61,15 +69,18 @@ def dual_confidence_filter(detections, track_conf_state):
     for det in detections:
         track_id = det.get("track_id")
         det_conf = clamp01(det.get("fused_score", det.get("score", 0.0)))
-        prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
-        track_conf = prev_track_conf * TRACK_CONF_DECAY
+        if track_id is None:
+            track_conf = det_conf
+        else:
+            prev_track_conf = clamp01(track_conf_state.get(track_id, det_conf))
+            track_conf = prev_track_conf * TRACK_CONF_DECAY
 
-        if det.get("matched_2d"):
-            track_conf += TRACK_CONF_BOOST_MATCHED
-        if det.get("motion_prior", 0.0) >= 0.35:
-            track_conf += TRACK_CONF_BOOST_MOTION
-        track_conf = clamp01(track_conf)
-        track_conf_state[track_id] = track_conf
+            if det.get("matched_2d"):
+                track_conf += TRACK_CONF_BOOST_MATCHED
+            if det.get("motion_prior", 0.0) >= 0.35:
+                track_conf += TRACK_CONF_BOOST_MOTION
+            track_conf = clamp01(track_conf)
+            track_conf_state[track_id] = track_conf
 
         combined_conf = DUAL_CONF_ALPHA * det_conf + (1.0 - DUAL_CONF_ALPHA) * track_conf
         keep = (det_conf >= DET_CONF_KEEP_THRESH) or (combined_conf >= DUAL_CONF_RECOVER_THRESH)
@@ -108,14 +119,21 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
             "last_dimensions": det.get("dimensions", [4.0, 1.8, 1.6]),
             "last_heading": det.get("heading", 0.0),
             "label": det.get("label", ""),
+            "last_center": list(det.get("center", [0.0, 0.0, 0.0])),
+            "last_speed": 0.0,
         })
-        if det.get("matched_2d"):
+        # 只要本帧被观测到（尤其是 cyclist/pedestrian 的 PVRCNN 观测），就应提升轨迹强度，
+        # 否则会出现“从未进入可预测状态”的问题。
+        if det.get("matched_2d") or det.get("source") == "pvrcnn":
             st["strength"] = 1.0
         else:
-            st["strength"] = max(st.get("strength", 0.5), 0.5)
+            st["strength"] = max(st.get("strength", 0.5), 0.7)
         st["last_dimensions"] = det.get("dimensions", st["last_dimensions"])
         st["last_heading"] = det.get("heading", st["last_heading"])
         st["label"] = det.get("label", st.get("label", ""))
+        st["last_center"] = list(det.get("center", st.get("last_center", [0.0, 0.0, 0.0])))
+        vx0, vy0 = det.get("velocity", [0.0, 0.0])
+        st["last_speed"] = float(math.hypot(vx0, vy0))
         track_state[tid] = st
         observed_ids.add(tid)
 
@@ -134,28 +152,63 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         st = track_state.get(tid)
         if st is None:
             continue
+        # 最多只对首个丢失帧做恢复，防止长期残留框
+        if trk.miss_count > 1:
+            track_state.pop(tid, None)
+            continue
+
+        # 若同类目标已在附近被新轨迹观测到，判为ID切换，删除旧轨迹避免幽灵框
+        lx, ly, _ = st.get("last_center", [0.0, 0.0, 0.0])
+        duplicate_nearby = any(
+            od.get("label") == st.get("label", trk.label) and
+            od.get("track_id") is not None and
+            od.get("track_id") != tid and
+            math.hypot(od.get("center", [0.0, 0.0, 0.0])[0] - lx, od.get("center", [0.0, 0.0, 0.0])[1] - ly) <= 4.0
+            for od in observed_dets
+        )
+        if duplicate_nearby:
+            track_state.pop(tid, None)
+            continue
 
         prev_strength = float(st.get("strength", 0.5))
-        new_strength = 0.5 if prev_strength >= 1.0 else 0.0
+        # 放宽缺失衰减门限：>=0.7 也允许进入一次预测恢复
+        new_strength = 0.5 if prev_strength >= 0.7 else 0.0
         if new_strength <= 0.0:
             track_state.pop(tid, None)
             continue
 
         vx, vy = trk.get_velocity()
         speed = math.hypot(vx, vy)
+        last_heading = float(st.get("last_heading", 0.0))
         if speed >= 0.1:
-            heading = float(math.atan2(vy, vx))
+            vel_heading = float(math.atan2(vy, vx))
+            # 朝向辅助：若速度方向与历史朝向差异过大，沿历史朝向收缩速度分量
+            if angle_diff_rad(vel_heading, last_heading) > math.radians(60.0):
+                align = math.cos(vel_heading - last_heading)
+                projected_speed = max(0.0, speed * max(align, 0.2))
+                vx = projected_speed * math.cos(last_heading)
+                vy = projected_speed * math.sin(last_heading)
+                speed = projected_speed
+                vel_heading = last_heading
+            heading = vel_heading
         else:
-            heading = float(st.get("last_heading", 0.0))
+            heading = last_heading
 
+        # 当前位置使用“当前帧预测状态 + 一小步速度前推”，并限制最大步长抑制跳变
         px = float(trk.x[0] + vx * dt_s)
         py = float(trk.x[1] + vy * dt_s)
+        lx, ly, lz = st.get("last_center", [px, py, 0.0])
+        step = math.hypot(px - lx, py - ly)
+        if step > MAX_RECOVERY_STEP_M:
+            scale = MAX_RECOVERY_STEP_M / max(step, 1e-6)
+            px = float(lx + (px - lx) * scale)
+            py = float(ly + (py - ly) * scale)
         rec = {
             "label": st.get("label", trk.label),
             "camera_label": "",
             "score": round(0.3 * new_strength, 4),
             "fused_score": round(0.3 * new_strength, 4),
-            "center": [px, py, 0.0],
+            "center": [px, py, float(lz)],
             "dimensions": st.get("last_dimensions", [4.0, 1.8, 1.6]),
             "heading": heading,
             "proj_bbox": None,
@@ -173,6 +226,8 @@ def apply_track_strength_recovery(observed_dets, mot, track_state, dt_s=0.1):
         }
         st["strength"] = new_strength
         st["last_heading"] = heading
+        st["last_center"] = [px, py, float(lz)]
+        st["last_speed"] = float(speed)
         track_state[tid] = st
         out.append(rec)
 
@@ -265,7 +320,8 @@ def main():
         dt_s = 0.1
         cur_ts = parse_ts(timestamp)
         if cur_ts is not None and prev_timestamp is not None:
-            dt_s = max((cur_ts - prev_timestamp).total_seconds(), 0.0)
+            dt_s = (cur_ts - prev_timestamp).total_seconds()
+            dt_s = dt_s if dt_s > 1e-3 else 0.1
         if cur_ts is not None:
             prev_timestamp = cur_ts
         output_dets = tracked if USE_TRACKING else tracked
