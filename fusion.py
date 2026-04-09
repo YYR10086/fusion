@@ -738,6 +738,9 @@ def fuse(
         if allow_cross_sensor_match and d3.get("camera_visible", True):
             theta_lidar = lidar_center_to_theta(d3["center"])
             for j, d2 in enumerate(det2d):
+                # 保持 1:1 匹配：一个 YOLO 框最多只能匹配一个 PVRCNN 目标
+                if j in used_yolo:
+                    continue
                 if d2["label"] != d3["label"]:
                     continue
                 theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
