@@ -32,8 +32,6 @@ logger = logging.getLogger("Fusion")
 CAMERA_FOV_DEG  = 150.0
 CAMERA_FOV_MARGIN_DEG = 8.0      # 视场边缘安全裕量，防止边界误检
 CAMERA_MAX_RANGE_M = 45.0        # 超过该距离默认不参与相机融合
-CAR_MAX_RANGE_M = 42.0
-RANGE_FILTER_BY_LABEL: Dict[str, float] = {"car": CAR_MAX_RANGE_M}  # 保留 42m 过滤（主要面向 car）
 MIN_VISIBLE_PIXEL_W = 12.0       # 预计投影过窄时视为相机不可见
 IMAGE_WIDTH     = 640
 IMAGE_HEIGHT    = 480
@@ -48,46 +46,23 @@ THETA_SIGMA_DEG = 6.0
 MIN_THETA_SIM   = 0.35
 STRICT_THETA_SIM_THRESH = 0.42    # 精度优先：theta 模式匹配阈值更严格
 CAR_THETA_SIM_THRESH = 0.38       # car 略放宽，但避免过低阈值引入误检
-FAR_RANGE_THETA_SIGMA_DEG = 9.0
-NEAR_RANGE_THETA_SIGMA_DEG = 4.5
-MOTION_GATING_DIST_M = 4.0
-MOTION_QUALITY_SIGMA_M = 2.0
-MOTION_QUALITY_WEIGHT = 0.25
-GEOMETRY_QUALITY_WEIGHT = 0.20
-THETA_QUALITY_WEIGHT = 0.55
 UNMATCHED_YOLO_MIN_SCORE = 0.25
 YOLO_HIGH_CONF_THRESH = 0.75
 PVRCNN_HIGH_CONF_KEEP = 0.8
-PVRCNN_MIN_KEEP_SCORE = 0.0       # 兼容旧参数（当前由分类别阈值控制）
-PVRCNN_KEEP_THRESH = {
-    "car": 0.00,
-    "truck": 0.00,
-    "bus": 0.75,          # bus 由更严格逻辑控制
-    "pedestrian": 0.00,
-    "cyclist": 0.00,
-}
-PVRCNN_VISIBLE_UNMATCHED_PENALTY = 0.00
-LOW_CONF_UNMATCHED_DROP_THRESH = {}
+PVRCNN_MIN_KEEP_SCORE = 0.0       # 以 PVRCNN 为主：默认不因分数直接删 LiDAR 目标
 CAR_OVERRIDE_MIN_MATCH_QUALITY = 0.78
 CAR_OVERRIDE_MIN_YOLO_CONF = 0.80
 CAR_OVERRIDE_MIN_PVRCNN_SCORE = 0.35
-ENABLE_BUS_SUPPRESSION = False
+ENABLE_BUS_SUPPRESSION = True
 BUS_MIN_KEEP_SCORE = 0.75         # bus 误检较多时提高准入门槛
 BUS_MIN_MATCH_QUALITY = 0.70      # 需要较高跨模态质量才保留 bus
 BUS_MIN_YOLO_CONF = 0.85
-ENFORCE_PVRCNN_BASELINE = True    # 不允许融合结果比 PVRCNN 更差
-SUPPRESS_TRUCK = True             # 按需求抑制 truck
-SUPPRESS_BUS = True               # 按需求抑制 bus
-SUPPRESS_REQUIRE_YOLO_CONFIRM = True
-SUPPRESS_RELEASE_YOLO_CONF = 0.90
-SUPPRESS_RELEASE_MATCH_QUALITY = 0.80
-APPLY_TRACKING = False            # 评估准确率时默认关闭卡尔曼后处理
 TIMESTAMP_TOL_S = 1
 MAX_MISS_FRAMES = 2
 OUTPUT_DIR      = "./fusion_output"
+CALIB_PATH      = "calib.txt"# kitti格式标定文件路径
 
 CANONICAL_LABELS = {"car", "bus", "truck", "pedestrian", "cyclist"}
-TRACK_FOCUS_LABELS = {"pedestrian", "cyclist"}  # 仅对弱小目标启用跟踪/速度估计
 
 # YOLO 原始标签 -> 统一标签
 YOLO_TO_CANONICAL: Dict[str, str] = {
@@ -147,19 +122,117 @@ def category_compatibility(yolo_label: str, pvrcnn_label: str) -> float:
     return 0.0
 
 # ============================================================
-# PART 3  工具函数
+# PART 3  标定参数解析（读取失败自动降级到 theta 模式）
 # ============================================================
-DEFAULT_FRAME_DT_S = 0.1
+class KITTICalib:
+    """
+    尝试从 calib_path 读取 KITTI 标定文件。
+    读取成功：use_calib=True，使用完整投影链做匹配。
+    读取失败：use_calib=False，降级到 theta 粗估模式，并打印警告。
+    """
 
-def parse_timestamp(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+    def __init__(self, calib_path: str):
+        self.use_calib = False
+        self.P2             = None
+        self.R0_rect        = None
+        self.Tr_velo_to_cam = None
+        self.K              = None
+
         try:
-            return datetime.strptime(ts, fmt)
-        except Exception:
-            continue
-    return None
+            data = self._parse(calib_path)
+            self.P2             = data["P2"].reshape(3, 4)
+
+            R0 = data["R0_rect"].reshape(3, 3)
+            self.R0_rect        = np.eye(4)
+            self.R0_rect[:3, :3] = R0
+
+            Tr = data["Tr_velo_to_cam"].reshape(3, 4)
+            self.Tr_velo_to_cam = np.eye(4)
+            self.Tr_velo_to_cam[:3, :] = Tr
+
+            self.K         = self.P2[:3, :3]
+            self.use_calib = True
+            logger.info(f"标定文件加载成功: {calib_path}")
+
+        except FileNotFoundError:
+            logger.warning(f"标定文件未找到: {calib_path}，降级到 theta 粗估模式")
+        except KeyError as e:
+            logger.warning(f"标定文件缺少字段 {e}: {calib_path}，降级到 theta 粗估模式")
+        except Exception as e:
+            logger.warning(f"标定文件解析失败 ({e})，降级到 theta 粗估模式")
+
+    @staticmethod
+    def _parse(path: str) -> Dict[str, np.ndarray]:
+        data = {}
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or ":" not in line:
+                    continue
+                key, val = line.split(":", 1)
+                data[key.strip()] = np.array(
+                    [float(x) for x in val.strip().split()]
+                )
+        return data
+
+    def lidar_to_img(self, pts_lidar: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(N,3) 激光雷达点 → 图像像素坐标 (N,2)，同时返回有效掩码"""
+        N    = pts_lidar.shape[0]
+        pts_h   = np.hstack([pts_lidar, np.ones((N, 1))])
+        pts_cam = (self.R0_rect @ self.Tr_velo_to_cam @ pts_h.T).T
+
+        in_front = pts_cam[:, 2] > 0
+
+        pts_img        = (self.P2 @ pts_cam.T).T
+        pts_img[:, 0] /= pts_img[:, 2]
+        pts_img[:, 1] /= pts_img[:, 2]
+        uv = pts_img[:, :2]
+
+        in_image = (
+            (uv[:, 0] >= 0) & (uv[:, 0] < IMAGE_WIDTH) &
+            (uv[:, 1] >= 0) & (uv[:, 1] < IMAGE_HEIGHT)
+        )
+        return uv, in_front & in_image
+
+    def box3d_to_bbox2d(self, center: List[float], dimensions: List[float],
+                         heading: float) -> Optional[List[float]]:
+        """3D 框 8 角点投影 → 图像 2D bbox [x1,y1,x2,y2]，不可见返回 None"""
+        cx, cy, cz = center
+        l, w, h    = dimensions
+        hl, hw, hh = l/2, w/2, h/2
+
+        corners_local = np.array([
+            [ hl,  hw, -hh], [ hl, -hw, -hh],
+            [-hl, -hw, -hh], [-hl,  hw, -hh],
+            [ hl,  hw,  hh], [ hl, -hw,  hh],
+            [-hl, -hw,  hh], [-hl,  hw,  hh],
+        ])
+        c, s = np.cos(heading), np.sin(heading)
+        rot  = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        corners_lidar = (rot @ corners_local.T).T + np.array([cx, cy, cz])
+
+        uv, valid = self.lidar_to_img(corners_lidar)
+        if valid.sum() == 0:
+            return None
+
+        uv_v = uv[valid]
+        x1 = float(np.clip(uv_v[:, 0].min(), 0, IMAGE_WIDTH  - 1))
+        y1 = float(np.clip(uv_v[:, 1].min(), 0, IMAGE_HEIGHT - 1))
+        x2 = float(np.clip(uv_v[:, 0].max(), 0, IMAGE_WIDTH  - 1))
+        y2 = float(np.clip(uv_v[:, 1].max(), 0, IMAGE_HEIGHT - 1))
+
+        if (x2 - x1) < 2 or (y2 - y1) < 2:
+            return None
+        return [x1, y1, x2, y2]
+
+# ============================================================
+# PART 4  工具函数
+# ============================================================
+def parse_timestamp(ts: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 def timestamps_aligned(ts1: str, ts2: str, tol_s: float = TIMESTAMP_TOL_S) -> bool:
     t1, t2 = parse_timestamp(ts1), parse_timestamp(ts2)
@@ -275,59 +348,6 @@ def angle_diff_deg(a: float, b: float) -> float:
     """返回两个角度（度）之间的最小差值。"""
     d = abs(a - b) % 360.0
     return float(min(d, 360.0 - d))
-
-
-def dynamic_theta_sigma_by_range(center: List[float]) -> float:
-    """距离越远，角度噪声越大，适当放宽匹配 sigma。"""
-    x, y, _ = center
-    dist = float(np.hypot(x, y))
-    ratio = float(np.clip(dist / max(CAMERA_MAX_RANGE_M, 1.0), 0.0, 1.0))
-    return float(
-        NEAR_RANGE_THETA_SIGMA_DEG +
-        (FAR_RANGE_THETA_SIGMA_DEG - NEAR_RANGE_THETA_SIGMA_DEG) * ratio
-    )
-
-
-def bbox_width(bbox: Optional[List[float]]) -> float:
-    if bbox is None:
-        return 0.0
-    return max(float(bbox[2] - bbox[0]), 0.0)
-
-
-def geometry_similarity_score(proj_bbox: Optional[List[float]], yolo_bbox: List[float]) -> float:
-    """
-    几何一致性：比较投影框与YOLO框宽度，抑制明显尺度不一致的误配。
-    返回 [0, 1]，1 表示宽度接近。
-    """
-    proj_w = bbox_width(proj_bbox)
-    yolo_w = bbox_width(yolo_bbox)
-    if proj_w < 1e-3 or yolo_w < 1e-3:
-        return 0.0
-    rel_err = abs(proj_w - yolo_w) / max(proj_w, yolo_w, 1e-6)
-    return float(np.exp(-3.0 * rel_err))
-
-
-def motion_prior_score(
-        center: List[float],
-        label: str,
-        motion_predictions: Optional[List[Dict]],
-) -> float:
-    """
-    卡尔曼预测先验：当前检测与预测位置越接近，先验越高。
-    """
-    if not motion_predictions:
-        return 0.0
-    candidates = [p for p in motion_predictions if p.get("label") == label]
-    if not candidates:
-        return 0.0
-    cx, cy = float(center[0]), float(center[1])
-    min_dist = min(
-        float(np.hypot(cx - p["pred_center"][0], cy - p["pred_center"][1]))
-        for p in candidates
-    )
-    if min_dist > MOTION_GATING_DIST_M:
-        return 0.0
-    return float(np.exp(-(min_dist ** 2) / (2 * (MOTION_QUALITY_SIGMA_M ** 2))))
 
 
 def theta_to_proj_bbox(det3d: Dict, img_width: int = IMAGE_WIDTH,
@@ -561,8 +581,6 @@ class KalmanTracker:
         self.label      = label
         self.miss_count = 0
         self.last_ts    = timestamp
-        self.prev_meas = np.array([x, y], dtype=np.float64)
-        self.prev_meas_ts = timestamp
         self.x = np.array([x, y, 0.0, 0.0], dtype=np.float64)
         self.P = np.diag([10.0, 10.0, 100.0, 100.0])
         self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float64)
@@ -578,20 +596,6 @@ class KalmanTracker:
             [dt3/2,0,dt2,0],  [0,dt3/2,0,dt2]
         ], dtype=np.float64)
 
-    def _speed_cap(self) -> float:
-        if self.label == "pedestrian":
-            return 4.0
-        if self.label == "cyclist":
-            return 12.0
-        return 30.0
-
-    def _accel_cap(self) -> float:
-        if self.label == "pedestrian":
-            return 2.0
-        if self.label == "cyclist":
-            return 3.5
-        return 6.0
-
     def predict(self, timestamp: str) -> np.ndarray:
         dt     = max(self._calc_dt(timestamp), 1e-3)
         F      = self._F(dt)
@@ -600,53 +604,12 @@ class KalmanTracker:
         self.last_ts = timestamp
         return self.x[:2].copy()
 
-    def peek_predict(self, timestamp: str) -> np.ndarray:
-        """
-        非破坏性预测：返回给定时刻的位置预测，但不修改滤波器内部状态。
-        用于融合阶段先验，避免“先预测一次 + update里再预测一次”导致的双重外推。
-        """
-        dt = max(self._calc_dt(timestamp), 1e-3)
-        F = self._F(dt)
-        x_pred = F @ self.x
-        return x_pred[:2].copy()
-
-    def update(self, x: float, y: float, timestamp: Optional[str] = None) -> np.ndarray:
+    def update(self, x: float, y: float) -> np.ndarray:
         z      = np.array([x, y], dtype=np.float64)
-        innovation = z - self.H @ self.x
-        # 大创新值通常对应误匹配或突发抖动，临时增大观测噪声抑制过度拉拽
-        R_eff = self.R
-        if float(np.linalg.norm(innovation)) > 4.0:
-            R_eff = self.R * 4.0
-        S      = self.H @ self.P @ self.H.T + R_eff
+        S      = self.H @ self.P @ self.H.T + self.R
         K      = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ innovation
+        self.x = self.x + K @ (z - self.H @ self.x)
         self.P = (np.eye(4) - K @ self.H) @ self.P
-
-        # 速度估计改为“两帧法”：仅用当前帧与上一帧观测差分
-        t_cur = parse_timestamp(timestamp) if timestamp else None
-        t_prev = parse_timestamp(self.prev_meas_ts) if self.prev_meas_ts else None
-        dt_meas = (t_cur - t_prev).total_seconds() if (t_cur and t_prev) else 0.0
-        if dt_meas <= 1e-3:
-            dt_meas = DEFAULT_FRAME_DT_S
-        if dt_meas > 0.0:
-            meas_v = (z - self.prev_meas) / dt_meas
-            speed = float(np.linalg.norm(meas_v))
-            speed_cap = self._speed_cap()
-            if speed > speed_cap:
-                meas_v *= (speed_cap / speed)
-
-            # 约束加速度，抑制速度突增导致的“闪现”
-            prev_v = self.x[2:].copy()
-            dv = meas_v - prev_v
-            max_dv = self._accel_cap() * dt_meas
-            dv_norm = float(np.linalg.norm(dv))
-            if dv_norm > max_dv > 0.0:
-                meas_v = prev_v + dv * (max_dv / dv_norm)
-            self.x[2:] = meas_v
-
-        self.prev_meas = z.copy()
-        if timestamp:
-            self.prev_meas_ts = timestamp
         self.miss_count = 0
         return self.x[:2].copy()
 
@@ -657,66 +620,41 @@ class KalmanTracker:
         t0 = parse_timestamp(self.last_ts)
         t1 = parse_timestamp(new_ts)
         if t0 is None or t1 is None:
-            return DEFAULT_FRAME_DT_S
-        dt = (t1 - t0).total_seconds()
-        return dt if dt > 1e-3 else DEFAULT_FRAME_DT_S
+            return 0.1
+        return max((t1 - t0).total_seconds(), 0.0)
 
 # ============================================================
 # PART 6  多目标跟踪管理器
 # ============================================================
 class MultiObjectTracker:
-    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 3.0, track_labels: Optional[set] = None):
+    def __init__(self, max_miss: int = MAX_MISS_FRAMES, match_dist: float = 5.0):
         self.tracks     : List[KalmanTracker] = []
         self.max_miss   = max_miss
         self.match_dist = match_dist
-        self.track_labels = set(track_labels or TRACK_FOCUS_LABELS)
 
     def update(self, detections: List[Dict], timestamp: str) -> List[Dict]:
-        focus_dets, passthrough = [], []
-        for d in detections:
-            if d.get("label") in self.track_labels:
-                focus_dets.append(d)
-            else:
-                passthrough.append(self._attach_passthrough(dict(d)))
+        if not self.tracks:
+            return [self._attach(dict(d), self._new_track(d, timestamp), [0.0, 0.0])
+                    for d in detections]
 
-        if not self.tracks and focus_dets:
-            tracked = [self._attach(dict(d), self._new_track(d, timestamp), [0.0, 0.0])
-                       for d in focus_dets]
-            out = tracked + passthrough
-            out.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
-            return out
+        pred_pos = np.array([t.predict(timestamp) for t in self.tracks])
+        det_pos  = np.array([[d["center"][0], d["center"][1]] for d in detections])
+        dist_mat = np.linalg.norm(pred_pos[:, None] - det_pos[None, :], axis=2)
 
-        if not focus_dets:
-            for trk in self.tracks:
-                trk.predict(timestamp)
-                trk.miss_count += 1
-            self.tracks = [t for t in self.tracks if t.miss_count <= self.max_miss]
-            passthrough.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
-            return passthrough
-
-        pred_pos = np.array([t.predict(timestamp) for t in self.tracks]) if self.tracks else np.zeros((0, 2))
-        det_pos  = np.array([[d["center"][0], d["center"][1]] for d in focus_dets])
-
-        pairs, matched_t, matched_d = {}, set(), set()
-        if len(self.tracks) > 0:
-            dist_mat = np.linalg.norm(pred_pos[:, None] - det_pos[None, :], axis=2)
-            row_ind, col_ind = linear_sum_assignment(dist_mat)
-            for r, c in zip(row_ind, col_ind):
-                trk = self.tracks[r]
-                speed = float(np.hypot(*trk.get_velocity()))
-                # 动态门限：目标越快允许位移略大，但整体不超过全局门限，抑制误关联导致的“幽灵框”
-                dyn_match_dist = min(self.match_dist, 1.2 + 0.5 * speed)
-                if (dist_mat[r, c] <= dyn_match_dist and
-                        trk.label == focus_dets[c]["label"]):
-                    pairs[r] = c; matched_t.add(r); matched_d.add(c)
+        row_ind, col_ind = linear_sum_assignment(dist_mat)
+        matched_t, matched_d, pairs = set(), set(), {}
+        for r, c in zip(row_ind, col_ind):
+            if (dist_mat[r, c] <= self.match_dist and
+                    self.tracks[r].label == detections[c]["label"]):
+                pairs[r] = c; matched_t.add(r); matched_d.add(c)
 
         smoothed = []
         for t_idx, d_idx in pairs.items():
-            d      = focus_dets[d_idx]
+            d      = detections[d_idx]
             trk    = self.tracks[t_idx]
-            trk.update(d["center"][0], d["center"][1], timestamp)
+            sx, sy = trk.update(d["center"][0], d["center"][1])
             out    = dict(d)
-            out["center"] = [float(d["center"][0]), float(d["center"][1]), float(d["center"][2])]
+            out["center"] = [sx, sy, d["center"][2]]
             smoothed.append(self._attach(out, trk, list(trk.get_velocity())))
 
         for i in range(len(self.tracks)):
@@ -724,39 +662,14 @@ class MultiObjectTracker:
                 self.tracks[i].miss_count += 1
         self.tracks = [t for t in self.tracks if t.miss_count <= self.max_miss]
 
-        for j in range(len(focus_dets)):
+        for j in range(len(detections)):
             if j not in matched_d:
-                d   = focus_dets[j]
+                d   = detections[j]
                 trk = self._new_track(d, timestamp)
                 smoothed.append(self._attach(dict(d), trk, [0.0, 0.0]))
 
-        out = smoothed + passthrough
-        out.sort(key=lambda x: x.get("fused_score", 0.0), reverse=True)
-        return out
-
-    def predict_states(self, timestamp: str, label: Optional[str] = None) -> List[Dict]:
-        """
-        输出当前时刻的卡尔曼预测状态（不改变 miss_count），用于融合阶段先验约束。
-        """
-        states = []
-        for trk in self.tracks:
-            if label is not None and trk.label != label:
-                continue
-            pred = trk.peek_predict(timestamp)
-            vx, vy = trk.get_velocity()
-            states.append({
-                "track_id": trk.track_id,
-                "label": trk.label,
-                "pred_center": [float(pred[0]), float(pred[1])],
-                "velocity": [float(vx), float(vy)],
-            })
-        return states
-
-    @staticmethod
-    def _attach_passthrough(d: Dict) -> Dict:
-        d["track_id"] = None
-        d["velocity"] = [0.0, 0.0]
-        return d
+        smoothed.sort(key=lambda x: x["fused_score"], reverse=True)
+        return smoothed
 
     def _new_track(self, d: Dict, ts: str) -> KalmanTracker:
         trk = KalmanTracker(d["center"][0], d["center"][1], d["label"], ts)
@@ -769,51 +682,37 @@ class MultiObjectTracker:
         d["velocity"] = [round(vel[0], 3), round(vel[1], 3)]
         return d
 
-
-def within_label_range(det: Dict, range_filter_by_label: Optional[Dict[str, float]] = None) -> bool:
-    """按类别距离阈值过滤（默认 car=42m），用于抑制远距误检。"""
-    if range_filter_by_label is None:
-        range_filter_by_label = RANGE_FILTER_BY_LABEL
-    label = str(det.get("label", "")).lower()
-    max_range = range_filter_by_label.get(label)
-    if max_range is None:
-        return True
-    cx, cy, _ = det.get("center", [0.0, 0.0, 0.0])
-    return float(np.hypot(cx, cy)) <= float(max_range)
-
 # ============================================================
 # PART 7  融合
 # ============================================================
 def fuse(
         pvrcnn_raw  : List[Dict],
         yolo_raw    : List[Dict],
-        motion_predictions: Optional[List[Dict]] = None,
+        calib       : KITTICalib,
         w_pvrcnn    : float = W_PVRCNN,
         w_yolo      : float = W_YOLO,
         fused_thresh: float = FUSED_THRESH,
         include_unmatched_yolo: bool = False,
-        include_track_predictions: bool = False,
-        camera_fov_only: bool = False,
+        camera_fov_only: bool = True,
         unmatched_yolo_min_score: float = UNMATCHED_YOLO_MIN_SCORE,
-        range_filter_by_label: Optional[Dict[str, float]] = None,
 ) -> List[Dict]:
-    del w_pvrcnn, w_yolo, camera_fov_only
+    del include_unmatched_yolo, unmatched_yolo_min_score  # 新策略：YOLO-only 一律不输出
 
     det3d = [pvrcnn_to_unified(d) for d in pvrcnn_raw]
     det2d = [yolo_to_unified(d) for d in yolo_raw]
     det3d = [d for d in det3d if d["label"]]
     det2d = [d for d in det2d if d["label"]]
 
-    # 按类别距离阈值做预过滤（默认 car=42m）
-    det3d = [d for d in det3d if within_label_range(d, range_filter_by_label)]
-
     # 仅保留高于最小置信度的 PVRCNN 目标（输出准入条件）
     det3d = [d for d in det3d if d["score"] >= PVRCNN_MIN_KEEP_SCORE]
     if not det3d:
         return []
 
-    # 按需求移除“预计相机不可见”过滤：全部 LiDAR 目标都可参与后续流程
-    det3d = [dict(d, camera_visible=True) for d in det3d]
+    # LiDAR 全保留，仅记录相机可见性（用于是否参与匹配）
+    if camera_fov_only:
+        det3d = [dict(d, camera_visible=lidar_in_strict_camera_view(d["center"], CAMERA_FOV_DEG)) for d in det3d]
+    else:
+        det3d = [dict(d, camera_visible=True) for d in det3d]
 
     ts3 = det3d[0]["timestamp"]
     ts2 = det2d[0]["timestamp"] if det2d else ts3
@@ -821,37 +720,37 @@ def fuse(
     if not allow_cross_sensor_match:
         logger.warning(f"时间戳差异过大: {ts3} vs {ts2}，仅输出 PVRCNN")
 
+    mode_tag = "标定投影" if calib.use_calib else "theta 粗估"
     proj_bboxes = [
-        theta_to_proj_bbox(d)
+        (calib.box3d_to_bbox2d(d["center"], d["dimensions"], d["heading"]) if calib.use_calib else theta_to_proj_bbox(d))
         if d.get("camera_visible", True) else None
         for d in det3d
     ]
 
     fused = []
-    matched_yolo_idx = set()
+    used_yolo = set()
     for i, d3 in enumerate(det3d):
         best_j = -1
         best_quality = 0.0
         best_yolo_conf = 0.0
         best_camera_label = ""
 
-        if allow_cross_sensor_match:
+        if allow_cross_sensor_match and d3.get("camera_visible", True):
             theta_lidar = lidar_center_to_theta(d3["center"])
-            theta_sigma = dynamic_theta_sigma_by_range(d3["center"])
-            motion_quality = motion_prior_score(d3["center"], d3["label"], motion_predictions)
             for j, d2 in enumerate(det2d):
+                # 保持 1:1 匹配：一个 YOLO 框最多只能匹配一个 PVRCNN 目标
+                if j in used_yolo:
+                    continue
                 if d2["label"] != d3["label"]:
                     continue
                 theta_diff = angle_diff_deg(theta_lidar, d2.get("theta", 0.0))
                 if theta_diff > THETA_MATCH_DEG:
                     continue
-                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * theta_sigma ** 2)))
-                geom_sim = geometry_similarity_score(proj_bboxes[i], d2["bbox"])
-                quality = (
-                    THETA_QUALITY_WEIGHT * theta_sim +
-                    GEOMETRY_QUALITY_WEIGHT * geom_sim +
-                    MOTION_QUALITY_WEIGHT * motion_quality
-                )
+                theta_sim = float(np.exp(-(theta_diff ** 2) / (2 * THETA_SIGMA_DEG ** 2)))
+                quality = theta_sim
+                if calib.use_calib and proj_bboxes[i] is not None:
+                    quality = max(quality, compute_iou_2d(proj_bboxes[i], d2["bbox"]))
+
                 cls_thresh = CAR_THETA_SIM_THRESH if d3["label"] == "car" else STRICT_THETA_SIM_THRESH
                 if quality >= cls_thresh and quality > best_quality:
                     best_quality = quality
@@ -861,40 +760,23 @@ def fuse(
 
         matched = best_j >= 0
         if matched:
-            matched_yolo_idx.add(best_j)
-        # 最终输出分数完全以 PVRCNN 为准；YOLO 仅做辅助匹配信息，不参与降权/提权
-        fused_score = d3["score"]
+            used_yolo.add(best_j)
+            # 关键修复：融合分数不能低于 PVRCNN 原始分数，避免“融合后比 PVRCNN 更差”
+            fusion_score = d3["score"] * w_pvrcnn + (best_yolo_conf * best_quality) * w_yolo
+            fused_score = max(d3["score"], fusion_score)
+        else:
+            # 无匹配时完全沿用 PVRCNN 分数
+            fused_score = d3["score"]
 
-        # 分类别最小置信度过滤：降低整体误检
-        if not ENFORCE_PVRCNN_BASELINE:
-            min_keep = PVRCNN_KEEP_THRESH.get(d3["label"], PVRCNN_MIN_KEEP_SCORE)
-            if d3.get("camera_visible", True) and (not matched):
-                min_keep += PVRCNN_VISIBLE_UNMATCHED_PENALTY
-            if d3["score"] < min_keep:
-                continue
-            # 对关键类别仅抑制“低分且未被YOLO确认”的可见目标，减少误检同时避免过度丢检
-            low_conf_drop = LOW_CONF_UNMATCHED_DROP_THRESH.get(d3["label"])
-            if (
-                low_conf_drop is not None
-                and d3.get("camera_visible", True)
-                and (not matched)
-                and d3["score"] < low_conf_drop
-            ):
-                continue
-
-        # 抑制高风险类别：bus / truck（除非通过高置信 YOLO 强确认）
-        suppress_label = (
-            (SUPPRESS_BUS and d3["label"] == "bus")
-            or (SUPPRESS_TRUCK and d3["label"] == "truck")
-        )
-        if suppress_label:
-            if not SUPPRESS_REQUIRE_YOLO_CONFIRM:
+        # bus 抑制策略：默认将 bus 视为高风险误检，需更高分且通过相机确认
+        if ENABLE_BUS_SUPPRESSION and d3["label"] == "bus":
+            if d3["score"] < BUS_MIN_KEEP_SCORE:
                 continue
             if (
                 (not matched)
-                or best_camera_label != d3["label"]
-                or best_yolo_conf < SUPPRESS_RELEASE_YOLO_CONF
-                or best_quality < SUPPRESS_RELEASE_MATCH_QUALITY
+                or best_quality < BUS_MIN_MATCH_QUALITY
+                or best_yolo_conf < BUS_MIN_YOLO_CONF
+                or best_camera_label != "bus"
             ):
                 continue
 
@@ -911,118 +793,13 @@ def fuse(
             "heading": d3["heading"],
             "proj_bbox": (det2d[best_j]["bbox"] if matched else proj_bboxes[i]),
             "matched_2d": matched,
-            "yolo_assisted": matched,  # 明确仅辅助，不产生独立输出
             "yolo_conf": round(best_yolo_conf if matched else 0.0, 4),
             "match_quality": round(best_quality if matched else 0.0, 4),
-            "motion_prior": round(motion_prior_score(d3["center"], d3["label"], motion_predictions), 4),
-            "fusion_mode": "theta",
+            "fusion_mode": mode_tag,
             "timestamp": d3["timestamp"],
-            "source": "pvrcnn",
+            "source": "pvrcnn+yolo" if matched else "pvrcnn",
             "camera_visible": d3.get("camera_visible", True),
         })
-
-    if include_unmatched_yolo and motion_predictions:
-        # 仅在“有轨迹预测”时，利用高分 YOLO 未匹配目标做短时补检
-        # 目的：提升 PVRCNN 短时漏检场景下的 TP 上限
-        used_pred_track_ids = set()
-        for j, d2 in enumerate(det2d):
-            if j in matched_yolo_idx or d2["score"] < unmatched_yolo_min_score:
-                continue
-
-            best_pred = None
-            best_theta_diff = float("inf")
-            for pred in motion_predictions:
-                if pred.get("track_id") in used_pred_track_ids:
-                    continue
-                if pred.get("label") != d2["label"]:
-                    continue
-                px, py = pred.get("pred_center", [0.0, 0.0])
-                pred_theta = lidar_center_to_theta([px, py, 0.0], clip_to_fov=False)
-                theta_diff = angle_diff_deg(pred_theta, d2.get("theta", 0.0))
-                if theta_diff <= THETA_MATCH_DEG and theta_diff < best_theta_diff:
-                    best_theta_diff = theta_diff
-                    best_pred = pred
-
-            if best_pred is None:
-                continue
-
-            px, py = best_pred.get("pred_center", [0.0, 0.0])
-            # 若已有同类检测在预测点附近，则不重复恢复
-            if any(
-                fd["label"] == d2["label"] and
-                float(np.hypot(fd["center"][0] - px, fd["center"][1] - py)) <= 2.5
-                for fd in fused
-            ):
-                continue
-
-            used_pred_track_ids.add(best_pred.get("track_id"))
-            theta_sim = float(np.exp(-(best_theta_diff ** 2) / (2 * (THETA_SIGMA_DEG ** 2))))
-            rec_score = float(np.clip(0.5 * d2["score"] + 0.5 * theta_sim, 0.0, 1.0))
-            dims = CLASS_SIZE_PRIOR.get(d2["label"], [4.0, 1.8, 1.6])
-            heading = float(np.arctan2(py, max(px, 1e-6)))
-
-            fused.append({
-                "label": d2["label"],
-                "camera_label": d2["label"],
-                "score": round(rec_score, 4),
-                "fused_score": round(rec_score, 4),
-                "center": [float(px), float(py), 0.0],
-                "dimensions": dims,
-                "heading": heading,
-                "proj_bbox": d2.get("bbox"),
-                "matched_2d": True,
-                "yolo_assisted": True,
-                "yolo_conf": round(d2["score"], 4),
-                "match_quality": round(theta_sim, 4),
-                "motion_prior": round(theta_sim, 4),
-                "fusion_mode": "theta+track_yolo_recover",
-                "timestamp": d2.get("timestamp", ts3),
-                "source": "track_yolo_recover",
-                "camera_visible": True,
-                "recovered_by_track_yolo": True,
-                "recovery_track_id": best_pred.get("track_id"),
-            })
-
-    if include_track_predictions and motion_predictions:
-        # 轨迹补框：当前帧短时漏检时，用卡尔曼预测位置补一个低分框
-        for pred in motion_predictions:
-            px, py = pred.get("pred_center", [0.0, 0.0])
-            label = pred.get("label", "")
-            if not label:
-                continue
-            if any(
-                fd["label"] == label and
-                float(np.hypot(fd["center"][0] - px, fd["center"][1] - py)) <= 2.5
-                for fd in fused
-            ):
-                continue
-
-            dims = CLASS_SIZE_PRIOR.get(label, [4.0, 1.8, 1.6])
-            heading = float(np.arctan2(py, max(px, 1e-6)))
-            pred_det = {
-                "label": label,
-                "camera_label": "",
-                "score": 0.30,
-                "fused_score": 0.30,
-                "center": [float(px), float(py), 0.0],
-                "dimensions": dims,
-                "heading": heading,
-                "matched_2d": False,
-                "yolo_assisted": False,
-                "yolo_conf": 0.0,
-                "match_quality": 0.0,
-                "motion_prior": 1.0,
-                "fusion_mode": "theta+track_prediction",
-                "timestamp": ts3,
-                "source": "track_prediction",
-                "camera_visible": True,
-                "recovered_by_track_prediction": True,
-                "recovery_track_id": pred.get("track_id"),
-            }
-            pred_det["proj_bbox"] = (
-                theta_to_proj_bbox(pred_det)
-            )
-            fused.append(pred_det)
 
     fused.sort(key=lambda x: x["fused_score"], reverse=True)
     return fused
@@ -1061,10 +838,10 @@ def visualize_bev(
         tid      = d.get("track_id", "?")
         vx, vy   = d.get("velocity", [0, 0])
         speed    = round((vx**2 + vy**2)**0.5, 2)
-        mode_prefix = "T" if str(d.get("fusion_mode", "")).startswith("theta") else "U"  # T=Theta U=Unknown
+        mode_tag = "C" if d.get("fusion_mode") == "标定投影" else "T"  # C=Calib T=Theta
         lpos     = w2c(cx, cy)
         cv2.putText(canvas,
-                    f"[{mode_prefix}]{d['label']}#{tid} {d['fused_score']:.2f} {speed}m/s",
+                    f"[{mode_tag}]{d['label']}#{tid} {d['fused_score']:.2f} {speed}m/s",
                     (lpos[0]-30, lpos[1]-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.33, (60, 60, 60), 1)
 
@@ -1080,27 +857,28 @@ def visualize_bev(
     return canvas
 
 # ============================================================
-# PART 8  主函数
+# PART 9  主函数
 # ============================================================
 mot = MultiObjectTracker()
 
 def process_frame(pvrcnn_raw: List[Dict], yolo_raw: List[Dict],
-                  ) -> List[Dict]:
+                  calib: KITTICalib) -> List[Dict]:
     timestamp = pvrcnn_raw[0].get("timestamp", "") if pvrcnn_raw else ""
     fused     = fuse(
         pvrcnn_raw,
         yolo_raw,
+        calib,
         include_unmatched_yolo=False,
-        camera_fov_only=False,
     )
     if not fused:
         return []
-    if not APPLY_TRACKING:
-        return fused
     return mot.update(fused, timestamp)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 尝试加载标定文件，失败自动降级到 theta 模式
+    calib = KITTICalib(CALIB_PATH)
 
     frames = [
         (pvrcnn_results, yolo_results),
@@ -1108,7 +886,7 @@ def main():
     ]
 
     for idx, (pvrcnn_raw, yolo_raw) in enumerate(frames):
-        results = process_frame(pvrcnn_raw, yolo_raw)
+        results = process_frame(pvrcnn_raw, yolo_raw, calib)
         visualize_bev(results,
                       save_path=os.path.join(OUTPUT_DIR, f"bev_frame_{idx+1:04d}.png"))
 
